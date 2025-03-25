@@ -68,7 +68,7 @@ If you found this library useful in academic or industry work, please consider c
 }
 ```
 
-## Finite Element Method (FEM)
+## Finite Element Method (FEM) [Original README.md content from here now for more detailed reference and jumpstart]
 ![Github Star](https://img.shields.io/github/stars/deepmodeling/jax-fem)
 ![Github Fork](https://img.shields.io/github/forks/deepmodeling/jax-fem)
 ![License](https://img.shields.io/github/license/deepmodeling/jax-fem)
