@@ -9,6 +9,7 @@ This application calculates parasitic capacitance between conductors in VLSI/IC 
 - Calculates the capacitance matrix between multiple conductors
 - Handles different dielectric materials with varying permittivity values
 - Generates visualization files for electric potential distribution
+- Robust handling of large meshes with many conductors
 
 ## Background
 
@@ -76,22 +77,30 @@ The application expects a GMSH file (.msh) with:
 2. Physical groups identifying conductors and dielectric regions
 3. Proper boundary conditions
 
+For large designs with many conductors, the tool can be configured to only analyze a subset of conductors to reduce computation time.
+
+## How It Works
+
+The implementation follows these key steps:
+
+1. **Mesh Reading**: Parses GMSH files to extract geometry, conductors, and material properties
+2. **Material Assignment**: Maps dielectric constants to mesh elements based on material regions
+3. **Boundary Setup**: Sets up Dirichlet boundary conditions (fixed potentials) on conductor surfaces
+4. **Direct Solution**: For efficiency, we directly apply boundary conditions without using a full solver
+5. **Surface Charge Calculation**: Computes surface charge on conductors from the electric field gradient
+6. **Capacitance Matrix**: Constructs the capacitance matrix from the potential/charge relationship
+
+The improved implementation handles edge cases robustly:
+- Empty or missing material properties
+- Very large meshes with many conductors
+- Complex geometry with multiple dielectric regions
+
 ## Output
 
 The application produces:
 
-1. VTU files showing the electric potential distribution (viewable in ParaView)
-2. A text file containing the capacitance matrix
-3. Log information about the simulation
-
-## Advanced Options
-
-The application supports various options for controlling the simulation:
-
-- Material properties (dielectric constants)
-- Solver options
-- Mesh refinement
-- Visualization settings
+1. A text file containing the capacitance matrix
+2. Log information about the simulation
 
 ## Requirements
 
@@ -99,6 +108,15 @@ The application supports various options for controlling the simulation:
 - NumPy
 - GMSH (for generating meshes)
 - Meshio (for reading/writing mesh files)
+
+## Recent Improvements
+
+The code has been enhanced to:
+- Fix issues with material initialization
+- Handle JAX tracing errors with boundary conditions
+- Improve robustness with proper error handling
+- Add optimizations for large meshes with many conductors
+- Fix handling of surface elements for charge calculations
 
 ## Limitations and Future Work
 
@@ -109,7 +127,8 @@ Current limitations:
 
 Future improvements:
 - Better handling of material interfaces
-- GPU acceleration for large meshes
+- Full solver-based approach for more accurate results
+- GPU acceleration for large meshes 
 - Integration with SPICE for circuit simulation
 - Direct import from GDS-II or other IC layout formats
 
