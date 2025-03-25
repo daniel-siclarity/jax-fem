@@ -1,0 +1,4384 @@
+This file is a merged representation of a subset of the codebase, containing files not matching ignore patterns, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching these patterns are excluded: **/*.inp, **/*.vtu, **/*.pvtu, **/*.crs, **/*.mat, **/*.svg, **/*.npy, **/*.gz, **/*.pth, LICENSE, **/tests, **/images, **/applications, **/demos-back-up,  **/*.toml
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+<additional_info>
+
+</additional_info>
+
+</file_summary>
+
+<directory_structure>
+demos/
+  poisson/
+    example.py
+    README.md
+jax_fem/
+  experimental/
+    adjoint_save_to_local.py
+    autodiff_utils.py
+    custom_jvp.py
+    jit_global.py
+    lm_solver.py
+    memory.py
+    petsc_solver.py
+    safe_grad.py
+    sparse.py
+    when_to_jit.py
+  __init__.py
+  basis.py
+  fe.py
+  generate_mesh.py
+  hessian.py
+  logger_setup.py
+  mma.py
+  problem.py
+  README.md
+  solver.py
+  utils.py
+.gitignore
+environment.yml
+package.json
+pyproject.toml
+README.md
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="package.json">
+{
+  "dependencies": {
+    "repomix": "^0.3.0"
+  }
+}
+</file>
+
+<file path="jax_fem/experimental/adjoint_save_to_local.py">
+import jax
+import jax.numpy as np
+import os
+
+jax.config.update("jax_enable_x64", True)
+
+crt_file_path = os.path.dirname(__file__)
+data_dir = os.path.join(crt_file_path, 'data')
+numpy_dir = os.path.join(data_dir, 'numpy')
+file_path = os.path.join(numpy_dir, 'tmp.npy')
+
+
+def raw_f(x, y):
+    return np.sin(x) * y
+
+@jax.custom_vjp
+def f(x, y):
+    return np.sin(x) * y
+
+def f_fwd(x, y):
+    np.save(file_path, np.cos(x))
+    return f(x, y), (np.sin(x), y)
+
+def f_bwd(res, g):
+    cos_x = np.load(file_path)
+    sin_x, y = res
+    return (cos_x * g * y, sin_x * g)
+
+f.defvjp(f_fwd, f_bwd)
+
+print(f(1., 2.))
+print(raw_f(1., 2.))
+
+print(jax.grad(f)(1., 2.))
+print(jax.grad(raw_f)(1., 2.))
+</file>
+
+<file path="jax_fem/experimental/autodiff_utils.py">
+"""This module contains functions to compute derivatives.
+
+Functions
+---------
+ad_wrapper_jvp
+    Wrapper for forward solve with a custom JVP rule
+implicit_jvp_helper
+    Helper function to compute JVP of FEA forward solve
+jax_array_list_to_numpy_diff
+    Convert a list of JAX arrays to a single numpy array. This function
+    is JITable. However, reverse-mode differentiation is not supported,
+    as it uses pure_callback functionality.
+jax_array_list_to_numpy_diff_jvp
+    JVP of jax_array_list_to_numpy_diff
+
+Todo:
+1. Make PETSc work for backward solve
+2. Working with sparsity [Might be important]
+3. Use saved tangent matrices for backward solve
+4. Create Primitive for all external calls
+"""
+#                                                                       Modules
+# =============================================================================
+# Standard
+from functools import partial
+from typing import List
+# Third-party
+import jax
+from jax import Array
+import numpy as onp
+# Local
+from jax_fem.solver import (apply_bc, get_flatten_fn, solver,
+                            jax_solve,
+                            get_jacobi_precond, jacobi_preconditioner)
+# =============================================================================
+
+
+def ad_wrapper_jvp(problem, linear: bool = False,
+                   use_petsc: bool = True) -> callable:
+    """Wrapper for forward solve with a custom JVP rule.
+    Both forward and backward autodiffs are supported.
+    Works well to find Hessian-vector products as well
+    However, this function is not JITable.
+
+    Parameters
+    ----------
+    problem
+        FEA problem object (of type FEM)
+    linear
+        If True, use linear solver. Otherwise, use nonlinear solver
+    use_petsc
+        If True, use PETSc solver. Otherwise, use JAX solver
+        Note: PETSc solvers are not supported for backward solve
+
+    Returns
+    -------
+    The output of the forward solve ie. the solution to FE problem
+    """
+    @jax.custom_jvp
+    def forward_solve(params):
+        problem.set_params(params)
+        # solver is not JITTable
+        sol = solver(problem, linear=linear, use_petsc=use_petsc)
+        return sol
+
+    @forward_solve.defjvp
+    def forward_solve_jvp(primals, tangents):
+        params, = primals
+        params_dot, = tangents
+        sol = forward_solve(params)
+        sol_dot = implicit_jvp_helper(
+            problem, sol, params, params_dot)
+        return sol.reshape(sol.shape), sol_dot.reshape(sol.shape)
+
+    return forward_solve
+
+
+def implicit_jvp_helper(problem, sol0: Array,
+                        params0: Array, params_dot0: Array) -> Array:
+    """Helper function to compute JVP of FEA forward solve.
+
+    The forward solve is setup such that it can use either
+    PETSc or JAX solvers. However, the backward solve is setup such
+    that only JAX solvers can be used.
+
+    Parameters
+    ----------
+    problem
+        FEA problem object
+    sol0
+        Solution of the forward solve
+    params0
+        Parameters of the forward solve
+    params_dot0
+        Parameters of the backward solve
+
+    Returns
+    -------
+    The output tangents of the forward solve
+    """
+    # create residual function
+
+    def residual(dofs, params):
+        """Function calculates the r(u(p), p) based on weak form.
+        r should be equal to 0 at the solution.
+        """
+        problem.set_params(params)
+        res_fn = problem.compute_residual
+        res_fn = get_flatten_fn(res_fn, problem)
+        res_fn = apply_bc(res_fn, problem)
+        return res_fn(dofs)
+
+    # For time-dependent problems
+    problem.set_params(params0)
+    problem.newton_update(sol0)
+    # Construct terms for JVP calculation
+    partial_fn_of_params = partial(residual, sol0)  # r(u=sol, p)
+
+    def change_arg_order_fn(params, dofs): return residual(dofs, params)
+    partial_fn_of_u = partial(change_arg_order_fn, params0)  # r(u, p=params)
+    # dr/du . x
+    _, jvp_fn = jax.linearize(partial_fn_of_u, sol0)
+
+    def backward_matvec(v): return jvp_fn(v.reshape(-1, problem.vec))
+    # dr/drho . v --> need a negative sign here - will provide later
+    _, backward_rhs = jax.jvp(partial_fn_of_params,
+                              (params0, ), (params_dot0, ))
+    # Call a JAX solver
+    precond_matrix = get_jacobi_precond(jacobi_preconditioner(problem))
+
+    def jax_solver_modified(matvec, v): return jax_solve(problem, matvec,
+                                                         v.reshape(-1), None,
+                                                         False,
+                                                         precond_matrix)
+    chosen_bb_solver = jax_solver_modified
+    # Find adjoint value
+    tangent_out = jax.lax.custom_linear_solve(backward_matvec, -1*backward_rhs,
+                                              chosen_bb_solver,
+                                              transpose_solve=chosen_bb_solver)
+    return tangent_out
+
+
+@jax.custom_jvp
+def jax_array_list_to_numpy_diff(jax_array_list:
+                                 List[Array]) -> onp.ndarray:
+    """Convert a list of JAX arrays to a single numpy array.
+    This function is JITable. However, reverse-mode differentiation
+    is not supported. This is used in the split_and_compute_cell
+    function in the jax_fem.core module as well as in the JVP rule
+    for the forward solve.
+
+    Parameters
+    ----------
+    jax_array_list
+        List of jax.numpy arrays
+
+    Returns
+    -------
+        numpy_array that vertically stacks the jax_array_list
+    """
+    # For compatibility with JIT
+
+    def _numpy_vstack(x): return onp.vstack(x).astype(x[0].dtype)
+    out_shape = list(jax_array_list[0].shape)
+    out_shape[0] *= len(jax_array_list)
+    output_shape_type = jax.ShapeDtypeStruct(shape=tuple(out_shape),
+                                             dtype=jax_array_list[0].dtype)
+    # Convert jax array to numpy array
+    # numpy_array = onp.vstack(jax_array_list)
+    numpy_array = jax.pure_callback(_numpy_vstack, output_shape_type,
+                                    jax_array_list)
+    return numpy_array
+
+
+@jax_array_list_to_numpy_diff.defjvp
+def jax_array_list_to_numpy_diff_jvp(primals, tangents):
+    """JVP of jax_array_list_to_numpy_diff"""
+    jax_array_list, = primals
+    jax_array_list_dot, = tangents
+    numpy_array = jax_array_list_to_numpy_diff(jax_array_list)
+    # Reroute the tangents
+    numpy_array_dot = jax_array_list_to_numpy_diff(jax_array_list_dot)
+    return numpy_array, numpy_array_dot
+
+
+# USING JAXOPT - only supports custom_vjp
+# def optimality_fn_wrapper(problem):
+#     def residual(dofs, params):
+#         """r(u, p) = 0"""
+#         problem.set_params(params)
+#         res_fn = problem.compute_residual
+#         res_fn = get_flatten_fn(res_fn, problem)
+#         res_fn = apply_bc(res_fn, problem)
+#         return res_fn(dofs) # need to adjust the shapes!!!!!!!!!!!!!!!!
+#     return residual
+
+
+# def solver_wrapper(problem, linear=True, use_petsc=False):
+
+#     @implicit_diff.custom_root(optimality_fn_wrapper(problem))
+#     def solve_for_u(dofs, params): # Ku = F
+#         """Solve for u given dofs and params"""
+#         del dofs
+#         problem.set_params(params)
+#         sol = solver(problem, linear=linear, use_petsc=use_petsc)
+#         return sol
+
+#     return solve_for_u
+</file>
+
+<file path="jax_fem/experimental/custom_jvp.py">
+import jax
+import jax.numpy as np
+import os
+
+
+def implicit_residual(x, y):
+    A = np.diag(np.array([1., 2., 3]))
+    # Assume that Ay - x = 0
+    return A @ y - x
+
+@jax.custom_jvp
+def newton_solver(x):
+    y_0 = np.zeros(3)
+    step_0 = 0
+    res_vec_0 = implicit_residual(x, y_0)
+    tol = 1e-8
+
+    def cond_fun(state):
+        step, res_vec, y = state
+        return np.linalg.norm(res_vec) > tol
+
+    def body_fun(state):
+        step, res_vec, y = state
+        f_partial = lambda y: implicit_residual(x, y)
+        jac = jax.jacfwd(f_partial)(y) # Works for small system
+        y_inc = np.linalg.solve(jac, -res_vec) # Works for small system
+        res_vec = f_partial(y + y_inc)
+        step_update = step + 1
+        return step_update, res_vec, y + y_inc
+
+    step_f, res_vec_f, y_f = jax.lax.while_loop(cond_fun, body_fun, (step_0, res_vec_0, y_0))
+    return y_f
+
+@newton_solver.defjvp
+def f_jvp(primals, tangents):
+    x, = primals
+    v, = tangents
+    y = newton_solver(x)
+    jac_x = jax.jacfwd(implicit_residual, argnums=0)(x, y) # Works for small system
+    jac_y = jax.jacfwd(implicit_residual, argnums=1)(x, y) # Works for small system
+    jvp_result = np.linalg.solve(jac_y, -(jac_x @ v[:, None]).reshape(-1)) # Works for small system
+    return y, jvp_result
+
+
+x = np.ones(3)
+y = newton_solver(x)
+print(f"\ny = {y}")
+
+jac_y_over_x_fwd = jax.jacfwd(newton_solver)(x)
+jac_y_over_x_rev = jax.jacrev(newton_solver)(x)
+
+print(f"\njac_y_over_x_fwd = \n{jac_y_over_x_fwd}")
+print(f"\njac_y_over_x_rev = \n{jac_y_over_x_rev}")
+</file>
+
+<file path="jax_fem/experimental/jit_global.py">
+import jax.numpy as np
+import jax
+
+class A:
+    def __init__(self):
+        self.f = self.get_fn()
+
+    def get_fn(self):
+        @jax.jit
+        def f():
+            return self.E
+        return f
+
+    def set_params(self, E):
+        self.E = E
+
+a = A()
+
+def test_fn_a(E):
+    a.set_params(E)
+    return a.f()
+
+E_a = 10.
+
+print(test_fn_a(E_a))
+print(jax.grad(test_fn_a)(E_a))
+
+
+class B:
+    def f(self):
+        return self.E
+
+    def set_params(self, E):
+        self.E = E
+
+b = B()
+
+@jax.jit
+def test_fn_b(E):
+    b.set_params(E)
+    return b.f()
+
+E_b = 10.
+
+print(test_fn_b(E_b))
+print(jax.grad(test_fn_b)(E_b))
+
+E_b = 20.
+
+print(test_fn_b(E_b))
+print(jax.grad(test_fn_b)(E_b))
+</file>
+
+<file path="jax_fem/experimental/lm_solver.py">
+################################################################################
+# Lagrangian multiplier solver
+
+# TODO: Old version, not working for multi-physics problems. Requires refactoring. 
+
+def aug_dof_w_zero_bc(problem, dofs):
+    aug_size = 0
+    for i in range(len(problem.node_inds_list)):
+        aug_size += len(problem.node_inds_list[i])
+    for i in range(len(problem.p_node_inds_list_A)):
+        aug_size += len(problem.p_node_inds_list_A[i])
+    return np.hstack((dofs, np.zeros(aug_size)))
+
+
+def aug_dof_w_bc(problem, dofs, p_num_eps):
+    aug_d = np.array([])
+    for i in range(len(problem.node_inds_list)):
+        aug_d = np.hstack((aug_d, p_num_eps * problem.vals_list[i]))
+    for i in range(len(problem.p_node_inds_list_A)):
+        aug_d = np.hstack(
+            (aug_d, np.zeros(len(problem.p_node_inds_list_A[i]))))
+    return np.hstack((dofs, aug_d))
+
+
+def linear_guess_solve_lm(problem, A_aug, p_num_eps, use_petsc):
+    b = (problem.body_force + problem.neumann).reshape(-1)
+    b_aug = aug_dof_w_bc(problem, b, p_num_eps)
+    if use_petsc:
+        dofs_aug = petsc_solve(A_aug, b_aug, 'minres', 'none')
+    else:
+        x0 = np.zeros((problem.num_total_nodes, problem.vec))
+        x0 = assign_bc(x0, problem)
+        x0 = aug_dof_w_zero_bc(problem, x0)
+        dofs_aug = jax_solve(problem, A_aug, b_aug, x0, None)
+    return dofs_aug
+
+
+def linear_incremental_solver_lm(problem, res_vec_aug, A_aug, dofs_aug,
+                                 p_num_eps, use_petsc):
+    b_aug = -res_vec_aug
+    if use_petsc:
+        inc_aug = petsc_solve(A_aug, b_aug, 'minres', 'none')
+    else:
+        inc_aug = jax_solve(problem, A_aug, b_aug, None, None)
+    dofs_aug = dofs_aug + inc_aug
+    return dofs_aug
+
+
+def compute_residual_lm(problem, res_vec, dofs_aug, p_num_eps):
+    """Some memo here
+    Saddle point problem energy function: L(u, lmbda) = E(u) + lmbda*(u - u0)
+    with dL/d(u, lmbda) = res_vec_aug and dE/du = res_vec
+    """
+    d_splits = np.cumsum(np.array([len(x) for x in problem.node_inds_list])).tolist()
+    p_splits = np.cumsum(np.array([len(x) for x in problem.p_node_inds_list_A])).tolist()
+
+    d_lmbda_len = d_splits[-1] if len(d_splits) > 0 else 0
+    p_lmbda_len = p_splits[-1] if len(p_splits) > 0 else 0
+
+    def get_Lagrangian():
+
+        def split_lamda(lmbda):
+            d_lmbda = lmbda[:d_lmbda_len]
+            p_lmbda = lmbda[d_lmbda_len:]
+            d_lmbda_split = np.split(d_lmbda, d_splits)
+            p_lmbda_split = np.split(p_lmbda, p_splits)
+            return d_lmbda_split, p_lmbda_split
+
+        # @jax.jit
+        def Lagrangian_fn(dofs_aug):
+            dofs, lmbda = dofs_aug[:problem.num_total_dofs], dofs_aug[problem.num_total_dofs:]
+            sol = dofs.reshape((problem.num_total_nodes, problem.vec))
+            d_lmbda_split, p_lmbda_split = split_lamda(lmbda)
+            lag = 0.
+            for i in range(len(problem.node_inds_list)):
+                lag += np.sum(d_lmbda_split[i] *
+                    (sol[problem.node_inds_list[i], problem.vec_inds_list[i]] - problem.vals_list[i]))
+
+            for i in range(len(problem.p_node_inds_list_A)):
+                lag += np.sum(p_lmbda_split[i] *
+                              (sol[problem.p_node_inds_list_A[i], problem.p_vec_inds_list[i]] -
+                               sol[problem.p_node_inds_list_B[i], problem.p_vec_inds_list[i]]))
+            return p_num_eps * lag
+
+        return Lagrangian_fn
+
+    Lagrangian_fn = get_Lagrangian()
+    A_fn = jax.grad(Lagrangian_fn)
+    res_vec_1 = A_fn(dofs_aug)
+    res_vec_2 = aug_dof_w_zero_bc(problem, res_vec)
+    res_vec_aug = res_vec_1 + res_vec_2
+
+    return res_vec_aug
+
+
+def get_A_fn_and_res_aug(problem, dofs_aug, res_vec, p_num_eps, use_petsc):
+
+    def symmetry(I, J, V):
+        I_sym = onp.hstack((I, J))
+        J_sym = onp.hstack((J, I))
+        V_sym = onp.hstack((V, V))
+        return I_sym, J_sym, V_sym
+
+    I_d = onp.array([])
+    J_d = onp.array([])
+    V_d = onp.array([])
+    group_index = problem.num_total_dofs
+    for i in range(len(problem.node_inds_list)):
+        group_size = len(problem.node_inds_list[i])
+        I_d = onp.hstack((I_d, problem.vec * problem.node_inds_list[i] +
+                          problem.vec_inds_list[i]))
+        J_d = onp.hstack((J_d, group_index + onp.arange(group_size)))
+        V_d = onp.hstack((V_d, p_num_eps * onp.ones(group_size)))
+        group_index += group_size
+    I_d_sym, J_d_sym, V_d_sym = symmetry(I_d, J_d, V_d)
+
+    I_p = onp.array([])
+    J_p = onp.array([])
+    V_p = onp.array([])
+    for i in range(len(problem.p_node_inds_list_A)):
+        group_size = len(problem.p_node_inds_list_A[i])
+        I_p = onp.hstack((I_p, problem.vec * problem.p_node_inds_list_A[i] +
+                          problem.p_vec_inds_list[i]))
+        J_p = onp.hstack((J_p, group_index + onp.arange(group_size)))
+        V_p = onp.hstack((V_p, p_num_eps * onp.ones(group_size)))
+        I_p = onp.hstack((I_p, problem.vec * problem.p_node_inds_list_B[i] +
+                          problem.p_vec_inds_list[i]))
+        J_p = onp.hstack((J_p, group_index + onp.arange(group_size)))
+        V_p = onp.hstack((V_p, -p_num_eps * onp.ones(group_size)))
+        group_index += group_size
+    I_p_sym, J_p_sym, V_p_sym = symmetry(I_p, J_p, V_p)
+
+    I = onp.hstack((problem.I, I_d_sym, I_p_sym))
+    J = onp.hstack((problem.J, J_d_sym, J_p_sym))
+    V = onp.hstack((problem.V, V_d_sym, V_p_sym))
+
+    logger.debug(f"Aug - Creating sparse matrix with scipy...")
+    A_sp_scipy_aug = scipy.sparse.csc_array((V, (I, J)), shape=(group_index, group_index))
+    # logger.info(f"Aug - Creating sparse matrix from scipy using JAX BCOO...")
+    A_sp_aug = BCOO.from_scipy_sparse(A_sp_scipy_aug).sort_indices()
+
+    # logger.info(f"Aug - Global sparse matrix takes about {A_sp_aug.data.shape[0]*8*3/2**30} G memory to store.")
+
+    # TODO: Potential bug
+    # Used only in jacobi_preconditioner
+    # problem.A_sp_scipy = A_sp_scipy_aug
+
+    def compute_linearized_residual(dofs_aug):
+        return A_sp_aug @ dofs_aug
+
+    if use_petsc:
+
+        A = PETSc.Mat().createAIJ(size=A_sp_scipy_aug.shape,
+                                  csr=(A_sp_scipy_aug.indptr.astype(PETSc.IntType, copy=False),
+                                       A_sp_scipy_aug.indices.astype(PETSc.IntType, copy=False),
+                                       A_sp_scipy_aug.data))
+
+        # A_aug = PETSc.Mat().createAIJ(size=A_sp_scipy_aug.shape,
+        #                               csr=(A_sp_scipy_aug.indptr,
+        #                                    A_sp_scipy_aug.indices,
+        #                                    A_sp_scipy_aug.data))
+    else:
+        A_aug = compute_linearized_residual
+
+    res_vec_aug = compute_residual_lm(problem, res_vec, dofs_aug, p_num_eps)
+
+    return A_aug, res_vec_aug
+
+
+def solver_lagrange_multiplier(problem, linear, use_petsc=True):
+    """The solver imposes Dirichlet B.C. and periodic B.C. with lagrangian multiplier method.
+
+    The global matrix is of the form
+    [A   B
+     B^T 0]
+    JAX built solver gmres and bicgstab sometimes fail to solve such a system.
+    PESTc solver minres seems to work.
+    TODO: explore which solver in PESTc is the best, and which preconditioner should be used.
+    Update: It seems that petsc_options={'ksp_type': 'tfqmr', 'pc_type': 'ilu'} works better.
+
+    Reference:
+    https://ethz.ch/content/dam/ethz/special-interest/baug/ibk/structural-mechanics-dam/education/femI/Presentation.pdf
+    """
+    logger.info(
+        f"Calling the lagrange multiplier solver for imposing Dirichlet B.C. and periodic B.C."
+    )
+    logger.info("Start timing")
+    start = time.time()
+    sol_shape = (problem.num_total_nodes, problem.vec)
+    dofs = np.zeros(sol_shape).reshape(-1)
+
+    # Ad-hoc parameter to get a better conditioned global matrix. Not useful for PETSc solver.
+    if hasattr(problem, 'p_num_eps'):
+        p_num_eps = problem.p_num_eps
+    else:
+        p_num_eps = 1.
+
+    if not use_petsc:
+        logger.info(
+            f"Setting p_num_eps = {p_num_eps}. If periodic B.C. fails to be applied, consider modifying this parameter."
+        )
+
+    def newton_update_helper(dofs_aug):
+        res_vec = problem.newton_update(
+            dofs_aug[:problem.num_total_dofs].reshape(sol_shape)).reshape(-1)
+        A_aug, res_vec_aug = get_A_fn_and_res_aug(problem, dofs_aug, res_vec,
+                                                  p_num_eps, use_petsc)
+        return res_vec_aug, A_aug
+
+    if linear:
+        # If we know the problem is linear, this way of solving seems faster.
+        dofs = assign_bc(dofs, problem)
+        dofs_aug = aug_dof_w_zero_bc(problem, dofs)
+        res_vec_aug, A_aug = newton_update_helper(dofs_aug)
+        dofs_aug = linear_incremental_solver_lm(problem, res_vec_aug, A_aug,
+                                                dofs_aug, p_num_eps, use_petsc)
+    else:
+        dofs_aug = aug_dof_w_zero_bc(problem, dofs)
+        res_vec_aug, A_aug = newton_update_helper(dofs_aug)
+        dofs_aug = linear_guess_solve_lm(problem, A_aug, p_num_eps, use_petsc)
+
+        res_vec_aug, A_aug = newton_update_helper(dofs_aug)
+        res_val = np.linalg.norm(res_vec_aug)
+        logger.debug(f"Before, res l_2 = {res_val}")
+        tol = 1e-6
+        while res_val > tol:
+            dofs_aug = linear_incremental_solver_lm(problem, res_vec_aug,
+                                                    A_aug, dofs_aug, p_num_eps,
+                                                    use_petsc)
+            res_vec_aug, A_aug = newton_update_helper(dofs_aug)
+            res_val = np.linalg.norm(res_vec_aug)
+            logger.debug(f"res l_2 dofs_aug = {res_val}")
+
+    sol = dofs_aug[:problem.num_total_dofs].reshape(sol_shape)
+    end = time.time()
+    solve_time = end - start
+    logger.info(f"Solve took {solve_time} [s]")
+    logger.debug(f"max of sol = {np.max(sol)}")
+    logger.debug(f"min of sol = {np.min(sol)}")
+
+    return sol
+</file>
+
+<file path="jax_fem/experimental/memory.py">
+import jax
+import jax.numpy as np
+import jax.profiler
+import numpy as onp
+
+def func1(x):
+  return np.tile(x, 10) * 0.5
+
+def func2(x):
+  y = func1(x)
+  return y, np.tile(x, 10) + 1
+
+x = jax.random.normal(jax.random.PRNGKey(42), (1000, 1000))
+y, z = func2(x)
+
+k = np.ones((10000, 10000))
+
+del k
+
+z.block_until_ready()
+
+jax.profiler.save_device_memory_profile(f"modules/fem/experiments/data/memory.prof")
+</file>
+
+<file path="jax_fem/experimental/petsc_solver.py">
+import numpy as onp
+import petsc4py
+petsc4py.init()
+from petsc4py import PETSc
+
+n = 10 # Size of vector
+x = PETSc.Vec().createSeq(n) # Faster way to create a sequential vector.
+
+x.setValues(range(n), range(n))
+
+print(x.getArray())
+print(x.getValues(3))
+print(x.getValues([1, 2]))
+
+x.setValues(range(n), range(n))
+x.shift(1)
+print(x.getArray())
+x.shift(-1)
+print(x.getArray())
+
+x.setValues(range(n), range(n))
+
+print(x.sum())
+print(x.min())
+print(x.max())
+
+print(x.dot(x)) # dot product with self
+ 
+print ('2-norm =', x.norm())
+print ('Infinity-norm =', x.norm(PETSc.NormType.NORM_INFINITY))
+
+m, n = 4, 4 # size of the matrix
+A = PETSc.Mat().createAIJ([m, n]) # AIJ represents sparse matrix
+A.setUp()
+A.assemble()
+
+print(A.getValues(range(m), range(n)))
+print(A.getValues(range(2), range(1)))
+
+A.setValue(1, 1, -1)
+A.setValue(0, 0, -2)
+A.setValue(2, 2, -5)
+A.setValue(3, 3, 6)                        
+# A.setValues([0, 1], [2, 3], [1, 1, 1, 1])
+
+# A.setValuesIJV([0, 1], [2, 3], [1, 1])
+
+A.assemble()
+
+A.zeroRows([0, 1])
+ 
+print(A.getValues(range(m), range(n)))
+
+
+exit()
+
+print(A.getSize())
+B = A.copy()
+B.transpose()
+print(A.getSize(), B.getSize())
+print(B.getValues(range(4), range(4)))
+
+C = A.matMult(B)
+print(C.getValues(range(m), range(n)))
+
+x = PETSc.Vec().createSeq(4) # making the x vector
+x.set(1) # assigning value 1 to all the elements
+y = PETSc.Vec().createSeq(4) # Put answer here.
+A.mult(e, y) # A*e = y
+print(y.getArray())
+
+
+print("Matrix A: ")
+print(A.getValues(range(m), range(n))) # printing the matrix A defined above
+
+b = PETSc.Vec().createSeq(4) # creating a vector
+b.setValues(range(4), [10, 5, 3, 6]) # assigning values to the vector
+
+print('\\n Vector b: ')
+print(b.getArray()) # printing the vector 
+
+x = PETSc.Vec().createSeq(4) # create the solution vector x
+
+ksp = PETSc.KSP().create() # creating a KSP object named ksp
+ksp.setOperators(A)
+
+# Allow for solver choice to be set from command line with -ksp_type <solver>.
+ksp.setFromOptions()
+print ('\\n Solving with:', ksp.getType()) # prints the type of solver
+
+# Solve!
+ksp.solve(b, x) 
+
+print('\\n Solution vector x: ')
+print(x.getArray())
+</file>
+
+<file path="jax_fem/experimental/safe_grad.py">
+"""
+Only under forward mode, safe_sqrt works. (for JAX version 0.4.26)
+"""
+import jax.numpy as np
+import jax
+
+
+def safe_sqrt(x):  
+    safe_x = np.where(x > 0., np.sqrt(x), 0.)
+    return safe_x
+
+
+print(jax.jacrev(np.sqrt)(0.)) # Expected inf
+print(jax.jacfwd(np.sqrt)(0.)) # Expected inf
+print(jax.jacrev(safe_sqrt)(0.)) # Expected nan
+print(jax.jacfwd(safe_sqrt)(0.)) # Expected 0.
+</file>
+
+<file path="jax_fem/hessian.py">
+import jax
+import jax.numpy as np
+import jax.flatten_util
+from jax_fem.solver import solver, linear_solver, get_flatten_fn, apply_bc, get_A
+
+
+def tree_l2_norm_error(self, θ1, θ2):
+    return np.sqrt(jax.tree_util.tree_reduce(lambda x, y: x + y,
+        jax.tree_util.tree_map(lambda x, y: np.sum((x - y)**2), θ1, θ2)))
+
+
+def forward_step(problem, θ, solver_options):
+    def F_fn(u, θ):
+        problem.set_params(θ)
+        res_fn = problem.compute_residual
+        res_fn = get_flatten_fn(res_fn, problem)
+        res_fn = apply_bc(res_fn, problem)
+        dofs = jax.flatten_util.ravel_pytree(u)[0]
+        res_vec = res_fn(dofs)
+        res_list = problem.unflatten_fn_sol_list(res_vec)
+        return res_list
+
+    # Solve forward problem
+    print(f"\n################## Solve forward problem...")
+    problem.set_params(θ)
+    u = solver(problem, solver_options) # Newton's method
+
+    return u, F_fn
+
+
+def adjoint_step(problem, u, θ, J_fn, F_fn, adjoint_solver_options):
+    # Solve adjoint problem
+    print(f"\n################## Solve adjoint problem...")
+    A = get_A(problem)
+    λ_rhs = jax.grad(J_fn)(u, θ)
+    λ_rhs_vec = jax.flatten_util.ravel_pytree(λ_rhs)[0]
+    A.transpose()
+    λ_vec = linear_solver(A, -λ_rhs_vec, None, adjoint_solver_options)
+    λ = problem.unflatten_fn_sol_list(λ_vec)
+    A.transpose() # This step is necessary because A is already changed (in-place update)
+    return λ, A
+
+
+def forward_and_adjoint(problem, θ, J_fn, solver_options, adjoint_solver_options):
+    u, F_fn = forward_step(problem, θ, solver_options)
+    λ, A = adjoint_step(problem, u, θ, J_fn, F_fn, adjoint_solver_options)
+    return u, λ, F_fn, A
+
+
+def incremental_forward_and_adjoint(u, θ, λ, θ_hat, J_fn, F_fn, A, state_linear_solver, adjoint_linear_solver):
+
+    _, unflatten = jax.flatten_util.ravel_pytree(u)
+
+    # Solve incremental forward problem
+    print(f"\n################## Solve incremental forward problem...")
+    u_hat_rhs = jax.jvp(lambda θ: F_fn(u, θ), (θ,), (θ_hat,))[1]
+    u_hat_rhs_vec = jax.flatten_util.ravel_pytree(u_hat_rhs)[0]
+    u_hat_vec = state_linear_solver(A, -u_hat_rhs_vec)
+    u_hat = unflatten(u_hat_vec)
+
+    # Solve incremental adjoint problem
+    print(f"\n################## Solve incremental adjoint problem...")
+    def grad_fn(u, θ):
+        grad_u, grad_θ = jax.grad(J_fn, argnums=(0, 1))(u, θ)
+        return grad_u, grad_θ
+
+    du_k_du_j_J_u_hat_j = jax.jvp(lambda u: grad_fn(u, θ)[0], (u,), (u_hat,))[1] # [(∂/∂u_k)(∂/∂u_j)J] * u_hat_j
+    du_k_dθ_j_J_θ_hat_j = jax.jvp(lambda θ: grad_fn(u, θ)[0], (θ,), (θ_hat,))[1] # [(∂/∂u_k)(∂/∂θ_j)J] * θ_hat_j
+    dθ_k_du_j_J_u_hat_j = jax.jvp(lambda u: grad_fn(u, θ)[1], (u,), (u_hat,))[1] # [(∂/∂θ_k)(∂/∂u_j)J] * u_hat_j
+    dθ_k_dθ_j_J_θ_hat_j = jax.jvp(lambda θ: grad_fn(u, θ)[1], (θ,), (θ_hat,))[1] # [(∂/∂θ_k)(∂/∂θ_j)J] * θ_hat_j
+
+    def vjp_fn(u, θ):
+        # Compute VJP of F_fn along λ at (u, θ) 
+        primals_out, vjp_func = jax.vjp(F_fn, u, θ)
+        vjp_u, vjp_θ = vjp_func(λ) # λ_i * (∂/∂u_k)F_i, λ_i * (∂/∂θ_k)F_i
+        return vjp_u, vjp_θ
+
+    du_k_du_j_F_i_λ_i_u_hat_j = jax.jvp(lambda u: vjp_fn(u, θ)[0], (u,), (u_hat,))[1] # [(∂/∂u_k)(∂/∂u_j)F_i] * λ_i * u_hat_j
+    du_k_dθ_j_F_i_λ_i_θ_hat_j = jax.jvp(lambda θ: vjp_fn(u, θ)[0], (θ,), (θ_hat,))[1] # [(∂/∂u_k)(∂/∂θ_j)F_i] * λ_i * θ_hat_j
+    dθ_k_du_j_F_i_λ_i_u_hat_j = jax.jvp(lambda u: vjp_fn(u, θ)[1], (u,), (u_hat,))[1] # [(∂/∂θ_k)(∂/∂u_j)F_i] * λ_i * u_hat_j
+    dθ_k_dθ_j_F_i_λ_i_θ_hat_j = jax.jvp(lambda θ: vjp_fn(u, θ)[1], (θ,), (θ_hat,))[1] # [(∂/∂θ_k)(∂/∂θ_j)F_i] * λ_i * θ_hat_j
+
+    λ_hat_rhs = jax.tree_util.tree_map(lambda x1, x2, x3, x4: x1 + x2 + x3 + x4,
+                                       du_k_du_j_J_u_hat_j, 
+                                       du_k_dθ_j_J_θ_hat_j, 
+                                       du_k_du_j_F_i_λ_i_u_hat_j, 
+                                       du_k_dθ_j_F_i_λ_i_θ_hat_j)
+
+    λ_hat_rhs_vec = jax.flatten_util.ravel_pytree(λ_hat_rhs)[0]
+    A.transpose()
+    λ_hat_vec = adjoint_linear_solver(A, -λ_hat_rhs_vec)
+    A.transpose()
+    λ_hat = unflatten(λ_hat_vec)
+
+    # Find hessian-vector product
+    print(f"\n################## Find hessian-vector product...")
+    primals_out, vjp_func = jax.vjp(F_fn, u, θ)
+    _, λ_hat_i_dF_i_dθ_k = vjp_func(λ_hat) # λ_hat_i * (∂/∂u_k)F_i, λ_hat_i * (∂/∂θ_k)F_i
+
+    dθ_dθ_J_θ_hat = jax.tree_util.tree_map(lambda x1, x2, x3, x4, x5: x1 + x2 + x3 + x4 + x5,
+                                           dθ_k_du_j_J_u_hat_j, 
+                                           dθ_k_dθ_j_J_θ_hat_j, 
+                                           dθ_k_du_j_F_i_λ_i_u_hat_j, 
+                                           dθ_k_dθ_j_F_i_λ_i_θ_hat_j,
+                                           λ_hat_i_dF_i_dθ_k)
+
+    print(f"\n################## Finshed using AD to find HVP.\n")
+
+    print(f"dθ_k_du_j_J_u_hat_j = {dθ_k_du_j_J_u_hat_j}")
+    print(f"dθ_k_dθ_j_J_θ_hat_j = {dθ_k_dθ_j_J_θ_hat_j}")
+    print(f"dθ_k_du_j_F_i_λ_i_u_hat_j = {dθ_k_du_j_F_i_λ_i_u_hat_j}")
+    print(f"dθ_k_dθ_j_F_i_λ_i_θ_hat_j = {dθ_k_dθ_j_F_i_λ_i_θ_hat_j}")
+    print(f"λ_hat_i_dF_i_dθ_k = {λ_hat_i_dF_i_dθ_k}")
+
+    print(f"AD = {dθ_dθ_J_θ_hat}")
+
+    return dθ_dθ_J_θ_hat
+</file>
+
+<file path="jax_fem/logger_setup.py">
+# logger.py
+import logging
+
+
+def setup_logger(name):
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+
+    # Ignore TensorFlow and JAX warnings
+    logging.getLogger("tensorflow").setLevel(logging.ERROR)
+    logging.getLogger("jax").setLevel(logging.ERROR)
+
+    # Create a handler
+    handler = logging.StreamHandler()
+
+    # Create a formatter
+    formatter = logging.Formatter('[%(asctime)s][%(levelname)s] %(name)s: %(message)s', datefmt='%m-%d %H:%M:%S')
+    # Add the formatter to the handler
+    handler.setFormatter(formatter)
+
+    # Check if the logger already has handlers. If the logger doesn't have any
+    # handlers, add the new handler and set propagate to False to prevent the
+    # log messages from being passed to the root logger and possibly being
+    # duplicated.
+
+    if not logger.handlers:
+        logger.addHandler(handler)
+        logger.propagate = False
+
+    return logger
+</file>
+
+<file path="jax_fem/experimental/sparse.py">
+import scipy
+import numpy as onp
+import jax
+import jax.numpy as np
+from jax.experimental.sparse import BCOO
+from jax_fem.experiments import sparsejac
+
+
+from jax.config import config
+config.update("jax_enable_x64", True)
+
+
+def exp1():
+    I = onp.array([3, 2, 2, 1, 0])
+    J = onp.array([3, 3, 3, 1, 2])
+    V = onp.array([10., 1., 2., 7., 9.])
+    A_sp = scipy.sparse.csc_array((V, (I, J)), shape=(4, 4))
+    print(A_sp)
+    A_sp.sort_indices()
+    print(A_sp)
+    print(A_sp.todense())
+
+
+def exp2():
+    M = np.array([[0., 2., 0.], [1., 0., 4.]])
+    M_sp = BCOO.fromdense(M)
+    R = M_sp + M_sp
+    print(M_sp.data)
+    print(R.sum_duplicates().data)
+
+
+def exp3():
+    I = onp.array([0,3,1,0])
+    J = onp.array([0,3,1,2])
+    V = onp.array([4.,5,7,9])
+    A = scipy.sparse.coo_matrix((V,(I,J)),shape=(4,4))
+
+    A_sp = BCOO.from_scipy_sparse(A)
+
+    print(A_sp.data)
+
+    fn = lambda x: x**2
+    sparsity = BCOO.fromdense(np.eye(10000))
+    x = jax.random.uniform(jax.random.PRNGKey(0), shape=(10000,))
+
+    sparse_fn = jax.jit(sparsejac.jacrev(fn, sparsity))
+
+    print(f"Finished JIT")
+
+    J = sparse_fn(x)
+    print(J)
+
+
+if __name__=="__main__":
+    exp1()
+</file>
+
+<file path="jax_fem/README.md">
+# JAX-FEM
+
+A differentiable 2D/3D finite element solver for automatic inverse design and mechanistic data science. This is the source code directory. Please visit [tutorial](https://github.com/tianjuxue/jax-fem/tree/main/demos) for more information.
+</file>
+
+<file path="jax_fem/experimental/when_to_jit.py">
+import jax.numpy as np
+import jax
+import time
+
+x = np.ones((1000, 1000), dtype=np.float32)  
+
+
+@jax.jit
+def f(x):
+    return x.T @ (x - x.mean(axis=0))
+
+def f1(x):
+    return f(x)
+
+
+def f2(x):
+    def f(x): 
+        return x.T @ (x - x.mean(axis=0))
+    f = jax.jit(f)
+    return f(x)
+
+
+@jax.jit
+def g(x):
+    return x.T @ (x - x.mean(axis=0))
+
+def f3(x, h):
+    return h(x)
+
+
+# Good: only jit once
+print(f"\nTest f1...")
+for i in range(10):
+    start = time.time()
+    a = f1(x).block_until_ready()
+    print(time.time() - start)
+
+
+# Bad: repeated jit
+print(f"\nTest f2...")
+for i in range(10):
+    start = time.time()
+    a = f2(x).block_until_ready()
+    print(time.time() - start)
+
+
+# Good: only jit once
+print(f"\nTest f3...")
+for i in range(10):
+    start = time.time()
+    a = f3(x, g).block_until_ready()
+    print(time.time() - start)
+</file>
+
+<file path="demos/poisson/README.md">
+# Poisson's Equation
+
+## Formulation
+
+The Poisson's equation is the canonical elliptic partial differential equation. Consider a domain $\Omega \subset \mathbb{R}^\textrm{d}$ with boundary $\partial \Omega = \Gamma_D \cup \Gamma_N$, the strong form gives
+
+$$
+\begin{align*}
+    -\nabla^2 u = b & \quad \textrm{in}  \nobreakspace \nobreakspace \Omega, \\
+    u = 0 &  \quad\textrm{on} \nobreakspace \nobreakspace \Gamma_D,  \\
+    \nabla u  \cdot \boldsymbol{n} = t  & \quad \textrm{on} \nobreakspace \nobreakspace \Gamma_N.
+\end{align*}
+$$
+
+The weak form gives
+
+$$
+\begin{align*}
+\int_{\Omega} \nabla u \cdot \nabla v \nobreakspace \nobreakspace \textrm{d}x = \int_{\Omega} b \nobreakspace v \nobreakspace \textrm{d}x + \int_{\Gamma_N} t\nobreakspace v \nobreakspace\nobreakspace \textrm{d}s.
+\end{align*}
+$$
+
+We have the following definitions:
+* $\Omega=(0,1)\times(0,1)$ (a unit square)
+* $\Gamma_D=\{(0, x_2)\cup (1, x_2)\subset\partial\Omega\}$ (Dirichlet boundary)
+* $\Gamma_N=\{(x_1, 0)\cup (x_1, 1)\subset\partial\Omega\}$ (Neumann boundary)
+* $b=10\nobreakspace\textrm{exp}\big(-((x_1-0.5)^2+(x_2-0.5)^2)/0.02 \big)$
+* $t=\textrm{sin}(5x_1)$
+
+## Execution
+Run
+```bash
+python -m demos.poisson.example
+```
+from the `jax-fem/` directory.
+
+
+## Results
+
+<p align="middle">
+  <img src="materials/sol.png" width="500" />
+</p>
+<p align="middle">
+    <em >Solution</em>
+</p>
+
+
+## References
+
+[1] https://fenicsproject.org/olddocs/dolfin/1.3.0/python/demo/documented/poisson/python/documentation.html
+
+[2] Xue, Tianju, et al. "JAX-FEM: A differentiable GPU-accelerated 3D finite element solver for automatic inverse design and mechanistic data science." *Computer Physics Communications* (2023): 108802.
+</file>
+
+<file path="jax_fem/basis.py">
+import basix
+import numpy as onp
+
+from jax_fem import logger
+
+
+# def get_full_integration_poly_degree(ele_type, lag_order, dim):
+#     """Only works for weak forms of (grad_u, grad_v).
+#     TODO: Is this correct?
+#     Reference:
+#     https://zhuanlan.zhihu.com/p/521630645
+#     """
+#     if ele_type == 'hexahedron' or ele_type == 'quadrilateral':
+#         return 2 * (dim*lag_order - 1)
+
+#     if ele_type == 'tetrahedron' or ele_type == 'triangle':
+#         return 2 * (dim*(lag_order - 1) - 1)
+
+def get_elements(ele_type):
+    """Mesh node ordering is important.
+    If the input mesh file is Gmsh .msh or Abaqus .inp, meshio would convert it to
+    its own ordering. My experience shows that meshio ordering is the same as Abaqus.
+    For example, for a 10-node tetrahedron element, the ordering of meshio is the following
+    https://web.mit.edu/calculix_v2.7/CalculiX/ccx_2.7/doc/ccx/node33.html
+    The troublesome thing is that basix has a different ordering. As shown below
+    https://defelement.com/elements/lagrange.html
+    The consequence is that we need to define this "re_order" variable to make sure the
+    ordering is correct.
+    """
+    element_family = basix.ElementFamily.P
+    if ele_type == 'HEX8':
+        re_order = [0, 1, 3, 2, 4, 5, 7, 6]
+        basix_ele = basix.CellType.hexahedron
+        basix_face_ele = basix.CellType.quadrilateral
+        gauss_order = 2 # 2x2x2, TODO: is this full integration?
+        degree = 1
+    elif ele_type == 'HEX27':
+        print(f"Warning: 27-node hexahedron is rarely used in practice and not recommended.")
+        re_order = [0, 1, 3, 2, 4, 5, 7, 6, 8, 11, 13, 9, 16, 18, 19,
+                    17, 10, 12, 15, 14, 22, 23, 21, 24, 20, 25, 26]
+        basix_ele = basix.CellType.hexahedron
+        basix_face_ele = basix.CellType.quadrilateral
+        gauss_order = 10 # 6x6x6, full integration
+        degree = 2
+    elif ele_type == 'HEX20':
+        re_order = [0, 1, 3, 2, 4, 5, 7, 6, 8, 11, 13, 9, 16, 18, 19, 17, 10, 12, 15, 14]
+        element_family = basix.ElementFamily.serendipity
+        basix_ele = basix.CellType.hexahedron
+        basix_face_ele = basix.CellType.quadrilateral
+        gauss_order = 2 # 6x6x6, full integration
+        degree = 2
+    elif ele_type == 'TET4':
+        re_order = [0, 1, 2, 3]
+        basix_ele = basix.CellType.tetrahedron
+        basix_face_ele = basix.CellType.triangle
+        gauss_order = 0 # 1, full integration
+        degree = 1
+    elif ele_type == 'TET10':
+        re_order = [0, 1, 2, 3, 9, 6, 8, 7, 5, 4]
+        basix_ele = basix.CellType.tetrahedron
+        basix_face_ele = basix.CellType.triangle
+        gauss_order = 2 # 4, full integration
+        degree = 2
+    # TODO: Check if this is correct.
+    elif ele_type == 'QUAD4':
+        re_order = [0, 1, 3, 2]
+        basix_ele = basix.CellType.quadrilateral
+        basix_face_ele = basix.CellType.interval
+        gauss_order = 2
+        degree = 1
+    elif ele_type == 'QUAD8':
+        re_order = [0, 1, 3, 2, 4, 6, 7, 5]
+        element_family = basix.ElementFamily.serendipity
+        basix_ele = basix.CellType.quadrilateral
+        basix_face_ele = basix.CellType.interval
+        gauss_order = 2
+        degree = 2
+    elif ele_type == 'TRI3':
+        re_order = [0, 1, 2]
+        basix_ele = basix.CellType.triangle
+        basix_face_ele = basix.CellType.interval
+        gauss_order = 0 # 1, full integration
+        degree = 1
+    elif ele_type == 'TRI6':
+        re_order = [0, 1, 2, 5, 3, 4]
+        basix_ele = basix.CellType.triangle
+        basix_face_ele = basix.CellType.interval
+        gauss_order = 2 # 3, full integration
+        degree = 2
+    else:
+        raise NotImplementedError
+
+    return element_family, basix_ele, basix_face_ele, gauss_order, degree, re_order
+
+
+def reorder_inds(inds, re_order):
+    new_inds = []
+    for ind in inds.reshape(-1):
+        new_inds.append(onp.argwhere(re_order == ind))
+    new_inds = onp.array(new_inds).reshape(inds.shape)
+    return new_inds
+
+
+def get_shape_vals_and_grads(ele_type, gauss_order=None):
+    """TODO: Add comments
+
+    Returns
+    -------
+    shape_values: ndarray
+        (8, 8) = (num_quads, num_nodes)
+    shape_grads_ref: ndarray
+        (8, 8, 3) = (num_quads, num_nodes, dim)
+    weights: ndarray
+        (8,) = (num_quads,)
+    """
+    element_family, basix_ele, basix_face_ele, gauss_order_default, degree, re_order = get_elements(ele_type)
+
+    if gauss_order is None:
+        gauss_order = gauss_order_default
+
+    quad_points, weights = basix.make_quadrature(basix_ele, gauss_order)
+    element = basix.create_element(element_family, basix_ele, degree)
+    vals_and_grads = element.tabulate(1, quad_points)[:, :, re_order, :]
+    shape_values = vals_and_grads[0, :, :, 0]
+    shape_grads_ref = onp.transpose(vals_and_grads[1:, :, :, 0], axes=(1, 2, 0))
+    logger.debug(f"ele_type = {ele_type}, quad_points.shape = (num_quads, dim) = {quad_points.shape}")
+    return shape_values, shape_grads_ref, weights
+
+
+def get_face_shape_vals_and_grads(ele_type, gauss_order=None):
+    """TODO: Add comments
+
+    Returns
+    -------
+    face_shape_vals: ndarray
+        (6, 4, 8) = (num_faces, num_face_quads, num_nodes)
+    face_shape_grads_ref: ndarray
+        (6, 4, 3) = (num_faces, num_face_quads, num_nodes, dim)
+    face_weights: ndarray
+        (6, 4) = (num_faces, num_face_quads)
+    face_normals:ndarray
+        (6, 3) = (num_faces, dim)
+    face_inds: ndarray
+        (6, 4) = (num_faces, num_face_vertices)
+    """
+    element_family, basix_ele, basix_face_ele, gauss_order_default, degree, re_order = get_elements(ele_type)
+
+    if gauss_order is None:
+        gauss_order = gauss_order_default
+
+    # TODO: Check if this is correct.
+    # We should provide freedom for seperate gauss_order for volume integral and surface integral
+    # Currently, they're using the same gauss_order!
+    points, weights = basix.make_quadrature(basix_face_ele, gauss_order)
+
+    map_degree = 1
+    lagrange_map = basix.create_element(basix.ElementFamily.P, basix_face_ele, map_degree)
+    values = lagrange_map.tabulate(0, points)[0, :, :, 0]
+    vertices = basix.geometry(basix_ele)
+    dim = len(vertices[0])
+    facets = basix.cell.sub_entity_connectivity(basix_ele)[dim - 1]
+    # Map face points
+    # Reference: https://docs.fenicsproject.org/basix/main/python/demo/demo_facet_integral.py.html
+    face_quad_points = []
+    face_inds = []
+    face_weights = []
+    for f, facet in enumerate(facets):
+        mapped_points = []
+        for i in range(len(points)):
+            vals = values[i]
+            mapped_point = onp.sum(vertices[facet[0]] * vals[:, None], axis=0)
+            mapped_points.append(mapped_point)
+        face_quad_points.append(mapped_points)
+        face_inds.append(facet[0])
+        jacobian = basix.cell.facet_jacobians(basix_ele)[f]
+        if dim == 2:
+            size_jacobian = onp.linalg.norm(jacobian)
+        else:
+            size_jacobian = onp.linalg.norm(onp.cross(jacobian[:, 0], jacobian[:, 1]))
+        face_weights.append(weights*size_jacobian)
+    face_quad_points = onp.stack(face_quad_points)
+    face_weights = onp.stack(face_weights)
+
+    face_normals = basix.cell.facet_outward_normals(basix_ele)
+    face_inds = onp.array(face_inds)
+    face_inds = reorder_inds(face_inds, re_order)
+    num_faces, num_face_quads, dim = face_quad_points.shape
+    element = basix.create_element(element_family, basix_ele, degree)
+    vals_and_grads = element.tabulate(1, face_quad_points.reshape(-1, dim))[:, :, re_order, :]
+    face_shape_vals = vals_and_grads[0, :, :, 0].reshape(num_faces, num_face_quads, -1)
+    face_shape_grads_ref = vals_and_grads[1:, :, :, 0].reshape(dim, num_faces, num_face_quads, -1)
+    face_shape_grads_ref = onp.transpose(face_shape_grads_ref, axes=(1, 2, 3, 0))
+    logger.debug(f"face_quad_points.shape = (num_faces, num_face_quads, dim) = {face_quad_points.shape}")
+    return face_shape_vals, face_shape_grads_ref, face_weights, face_normals, face_inds
+</file>
+
+<file path="jax_fem/mma.py">
+"""
+Copied and modified from https://github.com/UW-ERSL/AuTO
+Under GNU General Public License v3.0
+
+Original copy from https://github.com/arjendeetman/GCMMA-MMA-Python/blob/master/Code/MMA.py
+
+Improvement is made to avoid N^2 memory operation so that the MMA solver is more scalable.
+"""
+from numpy import diag as diags
+from numpy.linalg import solve
+import numpy as np
+import jax
+import jax.numpy as jnp
+from jax import jit, grad, random, jacfwd, value_and_grad
+from functools import partial
+import time
+import scipy
+from jax.experimental.sparse import BCOO
+
+from jax import config
+config.update("jax_enable_x64", True)
+
+density_filtering = False
+sensitivity_filtering = True
+
+def compute_filter_kd_tree(fe):
+    """This function is created by Tianju. Not from the original code.
+    We use k-d tree algorithm to compute the filter.
+    """
+    cell_centroids = np.mean(np.take(fe.points, fe.cells, axis=0), axis=1)
+    flex_num_cells = len(fe.flex_inds)
+    flex_cell_centroids = np.take(cell_centroids, fe.flex_inds, axis=0)
+
+    V = np.sum(fe.JxW)
+    avg_elem_V = V/fe.num_cells
+
+    avg_elem_size = avg_elem_V**(1./fe.dim)
+    rmin = 1.5*avg_elem_size
+
+    kd_tree = scipy.spatial.KDTree(flex_cell_centroids)
+    I = []
+    J = []
+    V = []
+    for i in range(flex_num_cells):
+        num_nbs = 20
+        dd, ii = kd_tree.query(flex_cell_centroids[i], num_nbs)
+        neighbors = np.take(flex_cell_centroids, ii, axis=0)
+        vals = np.where(rmin - dd > 0., rmin - dd, 0.)
+        I += [i]*num_nbs
+        J += ii.tolist()
+        V += vals.tolist()
+    H_sp = scipy.sparse.csc_array((V, (I, J)), shape=(flex_num_cells, flex_num_cells))
+
+    H = BCOO.from_scipy_sparse(H_sp).sort_indices()
+    Hs = H.sum(1).todense()
+    return H, Hs
+
+def applySensitivityFilter(ft, rho, dJ, dvc):
+    dJ = ft['H'] @ (rho*dJ/np.maximum(1e-3, rho)/ft['Hs'][:, None])
+    dvc = ft['H'][None, :, :] @ (rho[None, :, :]*dvc/np.maximum(1e-3, rho[None, :, :])/ft['Hs'][None, :, None])
+    return dJ, dvc
+
+def applyDensityFilter(ft, rho):
+    return ft['H'] @ rho / ft['Hs'][:, None]
+
+#%% Optimizer
+class MMA:
+    # The code was modified from [MMA Svanberg 1987]. Please cite the paper if
+    # you end up using this code.
+    def __init__(self):
+        self.epoch = 0;
+    def resetMMACounter(self):
+        self.epoch = 0;
+    def registerMMAIter(self, xval, xold1, xold2):
+        self.epoch += 1;
+        self.xval = xval;
+        self.xold1 = xold1;
+        self.xold2 = xold2;
+    def setNumConstraints(self, numConstraints):
+        self.numConstraints = numConstraints;
+    def setNumDesignVariables(self, numDesVar):
+        self.numDesignVariables = numDesVar;
+    def setMinandMaxBoundsForDesignVariables(self, xmin, xmax):
+        self.xmin = xmin;
+        self.xmax = xmax;
+    def setObjectiveWithGradient(self, obj, objGrad):
+        self.objective = obj;
+        self.objectiveGradient = objGrad;
+    def setConstraintWithGradient(self, cons, consGrad):
+        self.constraint = cons;
+        self.consGrad = consGrad;
+    def setScalingParams(self, zconst, zscale, ylinscale, yquadscale):
+        self.zconst = zconst;
+        self.zscale = zscale;
+        self.ylinscale = ylinscale;
+        self.yquadscale = yquadscale;
+    def setMoveLimit(self, movelim):
+        self.moveLimit = movelim;
+    def setLowerAndUpperAsymptotes(self, low, upp):
+        self.lowAsymp = low;
+        self.upAsymp = upp;
+
+    def getOptimalValues(self):
+        return self.xmma, self.ymma, self.zmma;
+    def getLagrangeMultipliers(self):
+        return self.lam, self.xsi, self.eta, self.mu, self.zet;
+    def getSlackValue(self):
+        return self.slack;
+    def getAsymptoteValues(self):
+        return self.lowAsymp, self.upAsymp;
+
+    # Function for the MMA sub problem
+    def mmasub(self, xval):
+        m = self.numConstraints;
+        n = self.numDesignVariables;
+        iter = self.epoch;
+        xmin, xmax = self.xmin, self.xmax;
+        xold1, xold2 = self.xold1, self.xold2;
+        f0val, df0dx = self.objective, self.objectiveGradient;
+        fval, dfdx = self.constraint, self.consGrad;
+        low, upp = self.lowAsymp, self.upAsymp;
+        a0, a, c, d = self.zconst, self.zscale, self.ylinscale, self.yquadscale;
+        move = self.moveLimit;
+
+        epsimin = 0.0000001
+        raa0 = 0.00001
+        albefa = 0.1
+        asyinit = 0.5
+        asyincr = 1.2
+        asydecr = 0.7
+        eeen = np.ones((n, 1))
+        eeem = np.ones((m, 1))
+        zeron = np.zeros((n, 1))
+        # Calculation of the asymptotes low and upp
+        if iter <= 2:
+            low = xval-asyinit*(xmax-xmin)
+            upp = xval+asyinit*(xmax-xmin)
+        else:
+            zzz = (xval-xold1)*(xold1-xold2)
+            factor = eeen.copy()
+            factor[np.where(zzz>0)] = asyincr
+            factor[np.where(zzz<0)] = asydecr
+            low = xval-factor*(xold1-low)
+            upp = xval+factor*(upp-xold1)
+            lowmin = xval-10*(xmax-xmin)
+            lowmax = xval-0.01*(xmax-xmin)
+            uppmin = xval+0.01*(xmax-xmin)
+            uppmax = xval+10*(xmax-xmin)
+            low = np.maximum(low,lowmin)
+            low = np.minimum(low,lowmax)
+            upp = np.minimum(upp,uppmax)
+            upp = np.maximum(upp,uppmin)
+        # Calculation of the bounds alfa and beta
+        zzz1 = low+albefa*(xval-low)
+        zzz2 = xval-move*(xmax-xmin)
+        zzz = np.maximum(zzz1,zzz2)
+        alfa = np.maximum(zzz,xmin)
+        zzz1 = upp-albefa*(upp-xval)
+        zzz2 = xval+move*(xmax-xmin)
+        zzz = np.minimum(zzz1,zzz2)
+        beta = np.minimum(zzz,xmax)
+        # Calculations of p0, q0, P, Q and b
+        xmami = xmax-xmin
+        xmamieps = 0.00001*eeen
+        xmami = np.maximum(xmami,xmamieps)
+        xmamiinv = eeen/xmami
+        ux1 = upp-xval
+        ux2 = ux1*ux1
+        xl1 = xval-low
+        xl2 = xl1*xl1
+        uxinv = eeen/ux1
+        xlinv = eeen/xl1
+        p0 = zeron.copy()
+        q0 = zeron.copy()
+        p0 = np.maximum(df0dx,0)
+        q0 = np.maximum(-df0dx,0)
+        pq0 = 0.001*(p0+q0)+raa0*xmamiinv
+        p0 = p0+pq0
+        q0 = q0+pq0
+        p0 = p0*ux2
+        q0 = q0*xl2
+        P = np.zeros((m,n)) ## @@ make sparse with scipy?
+        Q = np.zeros((m,n)) ## @@ make sparse with scipy?
+        P = np.maximum(dfdx,0)
+        Q = np.maximum(-dfdx,0)
+        PQ = 0.001*(P+Q)+raa0*np.dot(eeem,xmamiinv.T)
+        P = P+PQ
+        Q = Q+PQ
+
+        # P = (diags(ux2.flatten(),0).dot(P.T)).T
+        # Q = (diags(xl2.flatten(),0).dot(Q.T)).T
+        P = ux2.T*P
+        Q = xl2.T*Q
+
+        b = (np.dot(P,uxinv)+np.dot(Q,xlinv)-fval)
+        # Solving the subproblem by a primal-dual Newton method
+        xmma,ymma,zmma,lam,xsi,eta,mu,zet,s = subsolv(m,n,epsimin,low,upp,alfa,\
+                                                      beta,p0,q0,P,Q,a0,a,b,c,d)
+        # Return values
+        self.xmma, self.ymma, self.zmma = xmma, ymma, zmma;
+        self.lam, self.xsi, self.eta, self.mu, self.zet = lam,xsi,eta,mu,zet;
+        self.slack = s;
+        self.lowAsymp, self.upAsymp = low, upp;
+
+
+def subsolv(m,n,epsimin,low,upp,alfa,beta,p0,q0,P,Q,a0,a,b,c,d):
+    een = np.ones((n,1))
+    eem = np.ones((m,1))
+    epsi = 1
+    epsvecn = epsi*een
+    epsvecm = epsi*eem
+    x = 0.5*(alfa+beta)
+    y = eem.copy()
+    z = np.array([[1.0]])
+    lam = eem.copy()
+    xsi = een/(x-alfa)
+    xsi = np.maximum(xsi,een)
+    eta = een/(beta-x)
+    eta = np.maximum(eta,een)
+    mu = np.maximum(eem,0.5*c)
+    zet = np.array([[1.0]])
+    s = eem.copy()
+    itera = 0
+    # Start while epsi>epsimin
+    while epsi > epsimin:
+        epsvecn = epsi*een
+        epsvecm = epsi*eem
+        ux1 = upp-x
+        xl1 = x-low
+        ux2 = ux1*ux1
+        xl2 = xl1*xl1
+        uxinv1 = een/ux1
+        xlinv1 = een/xl1
+        plam = p0+np.dot(P.T,lam)
+        qlam = q0+np.dot(Q.T,lam)
+        gvec = np.dot(P,uxinv1)+np.dot(Q,xlinv1)
+        dpsidx = plam/ux2-qlam/xl2
+        rex = dpsidx-xsi+eta
+        rey = c+d*y-mu-lam
+        rez = a0-zet-np.dot(a.T,lam)
+        relam = gvec-a*z-y+s-b
+        rexsi = xsi*(x-alfa)-epsvecn
+        reeta = eta*(beta-x)-epsvecn
+        remu = mu*y-epsvecm
+        rezet = zet*z-epsi
+        res = lam*s-epsvecm
+        residu1 = np.concatenate((rex, rey, rez), axis = 0)
+        residu2 = np.concatenate((relam, rexsi, reeta, remu, rezet, res), axis = 0)
+        residu = np.concatenate((residu1, residu2), axis = 0)
+        residunorm = np.sqrt((np.dot(residu.T,residu)).item())
+        residumax = np.max(np.abs(residu))
+        ittt = 0
+        # Start while (residumax>0.9*epsi) and (ittt<200)
+        while (residumax > 0.9*epsi) and (ittt < 200):
+            ittt = ittt+1
+            itera = itera+1
+            ux1 = upp-x
+            xl1 = x-low
+            ux2 = ux1*ux1
+            xl2 = xl1*xl1
+            ux3 = ux1*ux2
+            xl3 = xl1*xl2
+            uxinv1 = een/ux1
+            xlinv1 = een/xl1
+            uxinv2 = een/ux2
+            xlinv2 = een/xl2
+            plam = p0+np.dot(P.T,lam)
+            qlam = q0+np.dot(Q.T,lam)
+            gvec = np.dot(P,uxinv1)+np.dot(Q,xlinv1)
+
+            # GG = (diags(uxinv2.flatten(),0).dot(P.T)).T-(diags\
+            #                          (xlinv2.flatten(),0).dot(Q.T)).T
+            GG = uxinv2.T*P - xlinv2.T*Q
+
+            dpsidx = plam/ux2-qlam/xl2
+            delx = dpsidx-epsvecn/(x-alfa)+epsvecn/(beta-x)
+            dely = c+d*y-lam-epsvecm/y
+            delz = a0-np.dot(a.T,lam)-epsi/z
+            dellam = gvec-a*z-y-b+epsvecm/lam
+            diagx = plam/ux3+qlam/xl3
+            diagx = 2*diagx+xsi/(x-alfa)+eta/(beta-x)
+            diagxinv = een/diagx
+            diagy = d+mu/y
+            diagyinv = eem/diagy
+            diaglam = s/lam
+            diaglamyi = diaglam+diagyinv
+            # Start if m<n
+            if m < n:
+                blam = dellam+dely/diagy-np.dot(GG,(delx/diagx))
+                bb = np.concatenate((blam,delz),axis = 0)
+                
+                # Alam = np.asarray(diags(diaglamyi.flatten(),0) \
+                #     +(diags(diagxinv.flatten(),0).dot(GG.T).T).dot(GG.T))
+                Alam = diags(diaglamyi.flatten(),0) + (diagxinv.T*GG).dot(GG.T)
+
+                AAr1 = np.concatenate((Alam,a),axis = 1)
+                AAr2 = np.concatenate((a,-zet/z),axis = 0).T
+                AA = np.concatenate((AAr1,AAr2),axis = 0)
+                solut = solve(AA,bb)
+                dlam = solut[0:m]
+                dz = solut[m:m+1]
+                dx = -delx/diagx-np.dot(GG.T,dlam)/diagx
+            else:
+                diaglamyiinv = eem/diaglamyi
+                dellamyi = dellam+dely/diagy
+                Axx = np.asarray(diags(diagx.flatten(),0) \
+                    +(diags(diaglamyiinv.flatten(),0).dot(GG).T).dot(GG))
+                azz = zet/z+np.dot(a.T,(a/diaglamyi))
+                axz = np.dot(-GG.T,(a/diaglamyi))
+                bx = delx+np.dot(GG.T,(dellamyi/diaglamyi))
+                bz = delz-np.dot(a.T,(dellamyi/diaglamyi))
+                AAr1 = np.concatenate((Axx,axz),axis = 1)
+                AAr2 = np.concatenate((axz.T,azz),axis = 1)
+                AA = np.concatenate((AAr1,AAr2),axis = 0)
+                bb = np.concatenate((-bx,-bz),axis = 0)
+                solut = solve(AA,bb)
+                dx = solut[0:n]
+                dz = solut[n:n+1]
+                dlam = np.dot(GG,dx)/diaglamyi-dz*(a/diaglamyi)\
+                    +dellamyi/diaglamyi
+                # End if m<n
+            dy = -dely/diagy+dlam/diagy
+            dxsi = -xsi+epsvecn/(x-alfa)-(xsi*dx)/(x-alfa)
+            deta = -eta+epsvecn/(beta-x)+(eta*dx)/(beta-x)
+            dmu = -mu+epsvecm/y-(mu*dy)/y
+            dzet = -zet+epsi/z-zet*dz/z
+            ds = -s+epsvecm/lam-(s*dlam)/lam
+            xx = np.concatenate((y,z,lam,xsi,eta,mu,zet,s),axis = 0)
+            dxx = np.concatenate((dy,dz,dlam,dxsi,deta,dmu,dzet,ds),axis = 0)
+            #
+            stepxx = -1.01*dxx/xx
+            stmxx = np.max(stepxx)
+            stepalfa = -1.01*dx/(x-alfa)
+            stmalfa = np.max(stepalfa)
+            stepbeta = 1.01*dx/(beta-x)
+            stmbeta = np.max(stepbeta)
+            stmalbe = max(stmalfa,stmbeta)
+            stmalbexx = max(stmalbe,stmxx)
+            stminv = max(stmalbexx,1.0)
+            steg = 1.0/stminv
+            #
+            xold = x.copy()
+            yold = y.copy()
+            zold = z.copy()
+            lamold = lam.copy()
+            xsiold = xsi.copy()
+            etaold = eta.copy()
+            muold = mu.copy()
+            zetold = zet.copy()
+            sold = s.copy()
+            #
+            itto = 0
+            resinew = 2*residunorm
+
+            # Start: while (resinew>residunorm) and (itto<50)
+            while (resinew > residunorm) and (itto < 50):
+                itto = itto+1
+                x = xold+steg*dx
+                y = yold+steg*dy
+                z = zold+steg*dz
+                lam = lamold+steg*dlam
+                xsi = xsiold+steg*dxsi
+                eta = etaold+steg*deta
+                mu = muold+steg*dmu
+                zet = zetold+steg*dzet
+                s = sold+steg*ds
+                ux1 = upp-x
+                xl1 = x-low
+                ux2 = ux1*ux1
+                xl2 = xl1*xl1
+                uxinv1 = een/ux1
+                xlinv1 = een/xl1
+                plam = p0+np.dot(P.T,lam)
+                qlam = q0+np.dot(Q.T,lam)
+                gvec = np.dot(P,uxinv1)+np.dot(Q,xlinv1)
+                dpsidx = plam/ux2-qlam/xl2
+                rex = dpsidx-xsi+eta
+                rey = c+d*y-mu-lam
+                rez = a0-zet-np.dot(a.T,lam)
+                relam = gvec-np.dot(a,z)-y+s-b
+                rexsi = xsi*(x-alfa)-epsvecn
+                reeta = eta*(beta-x)-epsvecn
+                remu = mu*y-epsvecm
+                rezet = np.dot(zet,z)-epsi
+                res = lam*s-epsvecm
+                residu1 = np.concatenate((rex,rey,rez),axis = 0)
+                residu2 = np.concatenate((relam,rexsi,reeta,remu,rezet,res), \
+                                         axis = 0)
+                residu = np.concatenate((residu1,residu2),axis = 0)
+                resinew = np.sqrt(np.dot(residu.T,residu))
+                steg = steg/2
+                # End: while (resinew>residunorm) and (itto<50)
+
+            residunorm = resinew.copy()
+            residumax = max(abs(residu))
+            steg = 2*steg
+            # End: while (residumax>0.9*epsi) and (ittt<200)
+        epsi = 0.1*epsi
+        # End: while epsi>epsimin
+
+    xmma = x.copy()
+    ymma = y.copy()
+    zmma = z.copy()
+    lamma = lam
+    xsimma = xsi
+    etamma = eta
+    mumma = mu
+    zetmma = zet
+    smma = s
+
+    return xmma,ymma,zmma,lamma,xsimma,etamma,mumma,zetmma,smma
+
+
+def optimize(fe, rho_ini, optimizationParams, objectiveHandle, consHandle, numConstraints):
+    # TODO: Scale objective function value to be always within 1-100
+    # See comments in https://doi.org/10.1016/j.compstruc.2018.01.008
+    H, Hs = compute_filter_kd_tree(fe)
+    ft = {'H':H, 'Hs':Hs}
+
+    rho = rho_ini
+
+    loop = 0
+    m = numConstraints # num constraints
+    n = len(rho.reshape(-1)) # num params
+
+    mma = MMA()
+    mma.setNumConstraints(numConstraints)
+    mma.setNumDesignVariables(n)
+    mma.setMinandMaxBoundsForDesignVariables\
+        (np.zeros((n,1)),np.ones((n,1)))
+
+    xval = rho.reshape(-1)[:, None] 
+    xold1, xold2 = xval.copy(), xval.copy()
+    mma.registerMMAIter(xval, xold1, xold2)
+    mma.setLowerAndUpperAsymptotes(np.ones((n,1)), np.ones((n,1)))
+    mma.setScalingParams(1.0, np.zeros((m,1)), \
+                         10000*np.ones((m,1)), np.zeros((m,1)))
+    # Move limit is an important parameter that affects TO result; default can be 0.2
+    mma.setMoveLimit(optimizationParams['movelimit']) 
+
+    while loop < optimizationParams['maxIters']:
+        loop = loop + 1
+
+        print(f"MMA solver...")
+        
+        if density_filtering:
+            rho_physical = applyDensityFilter(ft, rho)
+        else:
+            rho_physical = rho
+            
+        J, dJ = objectiveHandle(rho_physical)
+        vc, dvc = consHandle(rho_physical, loop)
+
+        if sensitivity_filtering:
+            dJ, dvc = applySensitivityFilter(ft, rho, dJ, dvc)
+
+        J, dJ = J, dJ.reshape(-1)[:, None]
+        vc, dvc = vc[:, None], dvc.reshape(dvc.shape[0], -1)
+
+        print(f"J.shape = {J.shape}")
+        print(f"dJ.shape = {dJ.shape}")
+        print(f"vc.shape = {vc.shape}")
+        print(f"dvc.shape = {dvc.shape}")
+
+        J, dJ, vc, dvc = np.array(J), np.array(dJ), np.array(vc), np.array(dvc)
+
+        start = time.time()
+
+        mma.setObjectiveWithGradient(J, dJ)
+        mma.setConstraintWithGradient(vc, dvc)
+        mma.mmasub(xval)
+        xmma, _, _ = mma.getOptimalValues()
+
+        xold2 = xold1.copy()
+        xold1 = xval.copy()
+        xval = xmma.copy()
+
+        mma.registerMMAIter(xval, xold1, xold2)
+        rho = xval.reshape(rho.shape)
+
+        end = time.time()
+
+        time_elapsed = end - start
+
+        print(f"MMA took {time_elapsed} [s]")
+
+        print(f'Iter {loop:d}; J {J:.5f}; constraint {vc}\n\n\n')
+
+    return rho
+</file>
+
+<file path="demos/poisson/example.py">
+# Import some generally useful packages.
+import jax
+import jax.numpy as np
+import os
+
+
+# Import JAX-FEM specific modules.
+from jax_fem.problem import Problem
+from jax_fem.solver import solver
+from jax_fem.utils import save_sol
+from jax_fem.generate_mesh import get_meshio_cell_type, Mesh, rectangle_mesh
+
+
+# Define constitutive relationship. 
+class Poisson(Problem):
+    # The function 'get_tensor_map' overrides base class method. Generally, JAX-FEM 
+    # solves -div.f(u_grad) = b. Here, we define f to be the indentity function. 
+    # We will see how f is deined as more complicated to solve non-linear problems 
+    # in later examples.
+    def get_tensor_map(self):
+        return lambda x: x
+    
+    # Define the source term b
+    def get_mass_map(self):
+        def mass_map(u, x):
+            val = -np.array([10*np.exp(-(np.power(x[0] - 0.5, 2) + np.power(x[1] - 0.5, 2)) / 0.02)])
+            return val
+        return mass_map
+
+    def get_surface_maps(self):
+        def surface_map(u, x):
+            return -np.array([np.sin(5.*x[0])])
+
+        return [surface_map, surface_map]
+
+
+# Specify mesh-related information. 
+# We make use of the external package 'meshio' and create a mesh named 'meshio_mesh', 
+# then converting it into a JAX-FEM compatible one.
+ele_type = 'QUAD4'
+cell_type = get_meshio_cell_type(ele_type)
+Lx, Ly = 1., 1.
+meshio_mesh = rectangle_mesh(Nx=32, Ny=32, domain_x=Lx, domain_y=Ly)
+mesh = Mesh(meshio_mesh.points, meshio_mesh.cells_dict[cell_type])
+
+
+# Define boundary locations.
+def left(point):
+    return np.isclose(point[0], 0., atol=1e-5)
+
+def right(point):
+    return np.isclose(point[0], Lx, atol=1e-5)
+
+def bottom(point):
+    return np.isclose(point[1], 0., atol=1e-5)
+
+def top(point):
+    return np.isclose(point[1], Ly, atol=1e-5)
+
+
+# Define Dirichlet boundary values. 
+# This means on the 'left' side, we apply the function 'dirichlet_val_left' 
+# to the 0 component of the solution variable; on the 'right' side, we apply 
+# 'dirichlet_val_right' to the 0 component.
+def dirichlet_val_left(point):
+    return 0.
+
+def dirichlet_val_right(point):
+    return 0.
+
+location_fns = [left, right]
+value_fns = [dirichlet_val_left, dirichlet_val_right]
+vecs = [0, 0]
+dirichlet_bc_info = [location_fns, vecs, value_fns]
+
+
+# Define Neumann boundary locations.
+# This means on the 'bottom' and 'top' side, we will perform the surface integral 
+# with the function 'get_surface_maps' defined in the class 'Poisson'.
+location_fns = [bottom, top]
+
+
+# Create an instance of the Class 'Poisson'. 
+# Here, vec is the number of components for the solution.
+problem = Poisson(mesh=mesh, vec=1, dim=2, ele_type=ele_type, dirichlet_bc_info=dirichlet_bc_info, location_fns=location_fns)
+
+
+# Solve the problem. 
+# solver_options can be changed for other linear solver options
+sol = solver(problem)
+# sol = solver(problem, solver_options={'umfpack_solver': {}})
+# sol = solver(problem, solver_options={'petsc_solver': {'ksp_type': 'bcgsl', 'pc_type': 'ilu'}})
+
+# Save the solution to a local folder that can be visualized with ParaWiew.
+data_dir = os.path.join(os.path.dirname(__file__), 'data')
+vtk_path = os.path.join(data_dir, f'vtk/u.vtu')
+save_sol(problem.fes[0], sol[0], vtk_path)
+</file>
+
+<file path="jax_fem/__init__.py">
+from pyfiglet import Figlet
+
+f = Figlet(font='starwars')
+print(f.renderText('JAX - FEM'))
+
+from .logger_setup import setup_logger
+# LOGGING
+logger = setup_logger(__name__)
+
+# TODO: Be automatic
+# __version__ = "0.0.8"
+</file>
+
+<file path="jax_fem/generate_mesh.py">
+import os
+import gmsh
+import numpy as onp
+import meshio
+
+from jax_fem.basis import get_elements
+from jax_fem.basis import get_face_shape_vals_and_grads
+
+import jax
+import jax.numpy as np
+
+
+class Mesh():
+    """
+    A custom mesh manager might be better using a third-party library like
+    meshio.
+    """
+    def __init__(self, points, cells, ele_type='TET4'):
+        # TODO (Very important for debugging purpose!): Assert that cells must have correct orders
+        self.points = points
+        self.cells = cells
+        self.ele_type = ele_type
+
+    def count_selected_faces(self, location_fn):
+        """Given location functions, compute the count of faces that satisfy
+        the location function. Useful for setting up distributed load
+        conditions.
+
+        Parameters
+        ----------
+        location_fns : List[Callable]
+            Callable: a function that inputs a point and returns a boolean
+            value describing whether the boundary condition should be applied.
+
+        Returns
+        -------
+        face_count : int
+        """
+        _, _, _, _, face_inds = get_face_shape_vals_and_grads(self.ele_type)
+        cell_points = onp.take(self.points, self.cells, axis=0)
+        cell_face_points = onp.take(cell_points, face_inds, axis=1)
+
+        vmap_location_fn = jax.vmap(location_fn)
+
+        def on_boundary(cell_points):
+            boundary_flag = vmap_location_fn(cell_points)
+            return onp.all(boundary_flag)
+
+        vvmap_on_boundary = jax.vmap(jax.vmap(on_boundary))
+        boundary_flags = vvmap_on_boundary(cell_face_points)
+        boundary_inds = onp.argwhere(boundary_flags)
+        return boundary_inds.shape[0]
+
+
+def check_mesh_TET4(points, cells):
+    # TODO
+    def quality(pts):
+        p1, p2, p3, p4 = pts
+        v1 = p2 - p1
+        v2 = p3 - p1
+        v12 = np.cross(v1, v2)
+        v3 = p4 - p1
+        return np.dot(v12, v3)
+    qlts = jax.vmap(quality)(points[cells])
+    return qlts
+
+
+def get_meshio_cell_type(ele_type):
+    """Reference:
+    https://github.com/nschloe/meshio/blob/9dc6b0b05c9606cad73ef11b8b7785dd9b9ea325/src/meshio/xdmf/common.py#L36
+    """
+    if ele_type == 'TET4':
+        cell_type = 'tetra'
+    elif ele_type == 'TET10':
+        cell_type = 'tetra10'
+    elif ele_type == 'HEX8':
+        cell_type = 'hexahedron'
+    elif ele_type == 'HEX27':
+        cell_type = 'hexahedron27'
+    elif  ele_type == 'HEX20':
+        cell_type = 'hexahedron20'
+    elif ele_type == 'TRI3':
+        cell_type = 'triangle'
+    elif ele_type == 'TRI6':
+        cell_type = 'triangle6'
+    elif ele_type == 'QUAD4':
+        cell_type = 'quad'
+    elif ele_type == 'QUAD8':
+        cell_type = 'quad8'
+    else:
+        raise NotImplementedError
+    return cell_type
+
+
+def rectangle_mesh(Nx, Ny, domain_x, domain_y):
+    """
+    QUAD4 mesh, generated by our own code
+    """
+    dim = 2
+    x = onp.linspace(0, domain_x, Nx + 1)
+    y = onp.linspace(0, domain_y, Ny + 1)
+    xv, yv = onp.meshgrid(x, y, indexing='ij')
+    points_xy = onp.stack((xv, yv), axis=dim)
+    points = points_xy.reshape(-1, dim)
+    points_inds = onp.arange(len(points))
+    points_inds_xy = points_inds.reshape(Nx + 1, Ny + 1)
+    inds1 = points_inds_xy[:-1, :-1]
+    inds2 = points_inds_xy[1:, :-1]
+    inds3 = points_inds_xy[1:, 1:]
+    inds4 = points_inds_xy[:-1, 1:]
+    cells = onp.stack((inds1, inds2, inds3, inds4), axis=dim).reshape(-1, 4)
+    out_mesh = meshio.Mesh(points=points, cells={'quad': cells})
+    return out_mesh
+
+
+def box_mesh(Nx, Ny, Nz, domain_x, domain_y, domain_z):
+    """
+    HEX8 mesh, generated by our own code
+    """
+    dim = 3
+    x = onp.linspace(0, domain_x, Nx + 1)
+    y = onp.linspace(0, domain_y, Ny + 1)
+    z = onp.linspace(0, domain_z, Nz + 1)
+    xv, yv, zv = onp.meshgrid(x, y, z, indexing='ij')
+    points_xyz = onp.stack((xv, yv, zv), axis=dim)
+    points = points_xyz.reshape(-1, dim)
+    points_inds = onp.arange(len(points))
+    points_inds_xyz = points_inds.reshape(Nx + 1, Ny + 1, Nz + 1)
+    inds1 = points_inds_xyz[:-1, :-1, :-1]
+    inds2 = points_inds_xyz[1:, :-1, :-1]
+    inds3 = points_inds_xyz[1:, 1:, :-1]
+    inds4 = points_inds_xyz[:-1, 1:, :-1]
+    inds5 = points_inds_xyz[:-1, :-1, 1:]
+    inds6 = points_inds_xyz[1:, :-1, 1:]
+    inds7 = points_inds_xyz[1:, 1:, 1:]
+    inds8 = points_inds_xyz[:-1, 1:, 1:]
+    cells = onp.stack((inds1, inds2, inds3, inds4, inds5, inds6, inds7, inds8),
+                      axis=dim).reshape(-1, 8)
+    out_mesh = meshio.Mesh(points=points, cells={'hexahedron': cells})
+    return out_mesh
+
+
+def box_mesh_gmsh(Nx, Ny, Nz, Lx, Ly, Lz, data_dir, ele_type='HEX8'):
+    """References:
+    https://gitlab.onelab.info/gmsh/gmsh/-/blob/master/examples/api/hex.py
+    https://gitlab.onelab.info/gmsh/gmsh/-/blob/gmsh_4_7_1/tutorial/python/t1.py
+    https://gitlab.onelab.info/gmsh/gmsh/-/blob/gmsh_4_7_1/tutorial/python/t3.py
+
+    Accepts ele_type = 'HEX8', 'TET4' or 'TET10', mesh will be generated with the help of gmsh
+    """
+
+    assert ele_type != 'HEX20', f"gmsh cannot produce HEX20 mesh?"
+
+    cell_type = get_meshio_cell_type(ele_type)
+    _, _, _, _, degree, _ = get_elements(ele_type)
+
+    msh_dir = os.path.join(data_dir, 'msh')
+    os.makedirs(msh_dir, exist_ok=True)
+    msh_file = os.path.join(msh_dir, 'box.msh')
+
+    offset_x = 0.
+    offset_y = 0.
+    offset_z = 0.
+    domain_x = Lx
+    domain_y = Ly
+    domain_z = Lz
+
+    gmsh.initialize()
+    gmsh.option.setNumber("Mesh.MshFileVersion", 2.2)  # save in old MSH format
+    if cell_type.startswith('tetra'):
+        Rec2d = False  # tris or quads
+        Rec3d = False  # tets, prisms or hexas
+    else:
+        Rec2d = True
+        Rec3d = True
+    p = gmsh.model.geo.addPoint(offset_x, offset_y, offset_z)
+    l = gmsh.model.geo.extrude([(0, p)], domain_x, 0, 0, [Nx], [1])
+    s = gmsh.model.geo.extrude([l[1]], 0, domain_y, 0, [Ny], [1], recombine=Rec2d)
+    v = gmsh.model.geo.extrude([s[1]], 0, 0, domain_z, [Nz], [1], recombine=Rec3d)
+
+    gmsh.model.geo.synchronize()
+    gmsh.model.mesh.generate(3)
+    gmsh.model.mesh.setOrder(degree)
+    gmsh.write(msh_file)
+    gmsh.finalize()
+
+    mesh = meshio.read(msh_file)
+    points = mesh.points # (num_total_nodes, dim)
+    cells =  mesh.cells_dict[cell_type] # (num_cells, num_nodes)
+    out_mesh = meshio.Mesh(points=points, cells={cell_type: cells})
+
+    return out_mesh
+
+
+def cylinder_mesh_gmsh(data_dir, R=5, H=10, circle_mesh=5, hight_mesh=20, rect_ratio=0.4):
+    """By Xinxin Wu at PKU in July, 2022
+    Reference: https://www.researchgate.net/post/How_can_I_create_a_structured_mesh_using_a_transfinite_volume_in_gmsh
+    R: radius
+    H: hight
+    circle_mesh:num of meshs in circle lines
+    hight_mesh:num of meshs in hight
+    rect_ratio: rect length/R
+    """
+    rect_coor = R*rect_ratio
+    msh_dir = os.path.join(data_dir, 'msh')
+    os.makedirs(msh_dir, exist_ok=True)
+    geo_file = os.path.join(msh_dir, 'cylinder.geo')
+    msh_file = os.path.join(msh_dir, 'cylinder.msh')
+
+    string='''
+        Point(1) = {{0, 0, 0, 1.0}};
+        Point(2) = {{-{rect_coor}, {rect_coor}, 0, 1.0}};
+        Point(3) = {{{rect_coor}, {rect_coor}, 0, 1.0}};
+        Point(4) = {{{rect_coor}, -{rect_coor}, 0, 1.0}};
+        Point(5) = {{-{rect_coor}, -{rect_coor}, 0, 1.0}};
+        Point(6) = {{{R}*Cos(3*Pi/4), {R}*Sin(3*Pi/4), 0, 1.0}};
+        Point(7) = {{{R}*Cos(Pi/4), {R}*Sin(Pi/4), 0, 1.0}};
+        Point(8) = {{{R}*Cos(-Pi/4), {R}*Sin(-Pi/4), 0, 1.0}};
+        Point(9) = {{{R}*Cos(-3*Pi/4), {R}*Sin(-3*Pi/4), 0, 1.0}};
+
+        Line(1) = {{2, 3}};
+        Line(2) = {{3, 4}};
+        Line(3) = {{4, 5}};
+        Line(4) = {{5, 2}};
+        Line(5) = {{2, 6}};
+        Line(6) = {{3, 7}};
+        Line(7) = {{4, 8}};
+        Line(8) = {{5, 9}};
+
+        Circle(9) = {{6, 1, 7}};
+        Circle(10) = {{7, 1, 8}};
+        Circle(11) = {{8, 1, 9}};
+        Circle(12) = {{9, 1, 6}};
+
+        Curve Loop(1) = {{1, 2, 3, 4}};
+        Plane Surface(1) = {{1}};
+        Curve Loop(2) = {{1, 6, -9, -5}};
+        Plane Surface(2) = {{2}};
+        Curve Loop(3) = {{2, 7, -10, -6}};
+        Plane Surface(3) = {{3}};
+        Curve Loop(4) = {{3, 8, -11, -7}};
+        Plane Surface(4) = {{4}};
+        Curve Loop(5) = {{4, 5, -12, -8}};
+        Plane Surface(5) = {{5}};
+
+        Transfinite Curve {{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}} = {circle_mesh} Using Progression 1;
+
+        Transfinite Surface {{1}};
+        Transfinite Surface {{2}};
+        Transfinite Surface {{3}};
+        Transfinite Surface {{4}};
+        Transfinite Surface {{5}};
+        Recombine Surface {{1, 2, 3, 4, 5}};
+
+        Extrude {{0, 0, {H}}} {{
+          Surface{{1:5}}; Layers {{{hight_mesh}}}; Recombine;
+        }}
+
+        Mesh 3;'''.format(R=R, H=H, rect_coor=rect_coor, circle_mesh=circle_mesh, hight_mesh=hight_mesh)
+
+    with open(geo_file, "w") as f:
+        f.write(string)
+    os.system("gmsh -3 {geo_file} -o {msh_file} -format msh2".format(geo_file=geo_file, msh_file=msh_file))
+
+    mesh = meshio.read(msh_file)
+    points = mesh.points # (num_total_nodes, dim)
+    cells =  mesh.cells_dict['hexahedron'] # (num_cells, num_nodes)
+
+    # The mesh somehow has two redundant points...
+    points = onp.vstack((points[1:14], points[15:]))
+    cells = onp.where(cells > 14, cells - 2, cells - 1)
+
+    out_mesh = meshio.Mesh(points=points, cells={'hexahedron': cells})
+    return out_mesh
+</file>
+
+<file path="jax_fem/utils.py">
+import jax
+import numpy as onp
+import meshio
+import json
+import os
+import time
+from functools import wraps
+
+from jax_fem import logger
+from jax_fem.generate_mesh import get_meshio_cell_type
+
+
+def save_sol(fe, sol, sol_file, cell_infos=None, point_infos=None):
+    cell_type = get_meshio_cell_type(fe.ele_type)
+    sol_dir = os.path.dirname(sol_file)
+    os.makedirs(sol_dir, exist_ok=True)
+    out_mesh = meshio.Mesh(points=fe.points, cells={cell_type: fe.cells})
+    out_mesh.point_data['sol'] = onp.array(sol, dtype=onp.float32)
+    if cell_infos is not None:
+        for cell_info in cell_infos:
+            name, data = cell_info
+            # TODO: vector-valued cell data
+            assert data.shape == (fe.num_cells,), f"cell data wrong shape, get {data.shape}, while num_cells = {fe.num_cells}"
+            out_mesh.cell_data[name] = [onp.array(data, dtype=onp.float32)]
+    if point_infos is not None:
+        for point_info in point_infos:
+            name, data = point_info
+            assert len(data) == len(sol), "point data wrong shape!"
+            out_mesh.point_data[name] = onp.array(data, dtype=onp.float32)
+    out_mesh.write(sol_file)
+
+
+def modify_vtu_file(input_file_path, output_file_path):
+    """Convert version 2.2 of vtu file to version 1.0
+    meshio does not accept version 2.2, raising error of
+    meshio._exceptions.ReadError: Unknown VTU file version '2.2'.
+    """
+    fin = open(input_file_path, "r")
+    fout = open(output_file_path, "w")
+    for line in fin:
+        fout.write(line.replace('<VTKFile type="UnstructuredGrid" version="2.2">', '<VTKFile type="UnstructuredGrid" version="1.0">'))
+    fin.close()
+    fout.close()
+
+
+def read_abaqus_and_write_vtk(abaqus_file, vtk_file):
+    """Used for a quick inspection. Paraview can't open .inp file so we convert it to .vtu
+    """
+    meshio_mesh = meshio.read(abaqus_file)
+    meshio_mesh.write(vtk_file)
+
+
+def json_parse(json_filepath):
+    with open(json_filepath) as f:
+        args = json.load(f)
+    json_formatted_str = json.dumps(args, indent=4)
+    print(json_formatted_str)
+    return args
+
+
+def make_video(data_dir):
+    # The command -pix_fmt yuv420p is to ensure preview of video on Mac OS is
+    # enabled
+    # https://apple.stackexchange.com/questions/166553/why-wont-video-from-ffmpeg-show-in-quicktime-imovie-or-quick-preview
+    # The command -vf "pad=ceil(iw/2)*2:ceil(ih/2)*2" is to solve the following
+    # "not-divisible-by-2" problem
+    # https://stackoverflow.com/questions/20847674/ffmpeg-libx264-height-not-divisible-by-2
+    # -y means always overwrite
+
+    # TODO
+    os.system(
+        f'ffmpeg -y -framerate 10 -i {data_dir}/png/tmp/u.%04d.png -pix_fmt yuv420p -vf \
+               "crop=trunc(iw/2)*2:trunc(ih/2)*2" {data_dir}/mp4/test.mp4') # noqa
+
+
+# A simpler decorator for printing the timing results of a function
+def timeit(func):
+
+    @wraps(func)
+    def timeit_wrapper(*args, **kwargs):
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        end_time = time.perf_counter()
+        total_time = end_time - start_time
+        logger.debug(f'Function {func.__name__} took {total_time:.4f} seconds')
+        return result
+
+    return timeit_wrapper
+
+
+# Wrapper for writing timing results to a file
+def walltime(txt_dir=None, filename=None):
+
+    def decorate(func):
+
+        def wrapper(*list_args, **keyword_args):
+            start_time = time.time()
+            return_values = func(*list_args, **keyword_args)
+            end_time = time.time()
+            time_elapsed = end_time - start_time
+            platform = jax.lib.xla_bridge.get_backend().platform
+            logger.info(
+                f"Time elapsed {time_elapsed} of function {func.__name__} "
+                f"on platform {platform}"
+            )
+            if txt_dir is not None:
+                os.makedirs(txt_dir, exist_ok=True)
+                fname = 'walltime'
+                if filename is not None:
+                    fname = filename
+                with open(os.path.join(txt_dir, f"{fname}_{platform}.txt"),
+                          'w') as f:
+                    f.write(f'{start_time}, {end_time}, {time_elapsed}\n')
+            return return_values
+
+        return wrapper
+
+    return decorate
+</file>
+
+<file path="pyproject.toml">
+[build-system]
+requires = ["setuptools>=43.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jax-fem"
+version = "0.0.8"
+requires-python = ">=3.9"
+authors = [
+  {name = "Tianju Xue", email = "cetxue@ust.hk"},
+  {name = "Weipeng Xu", email = "xwpscut@outlook.com"}
+]
+description = "A GPU accelerated Finite element analysis package in JAX."
+readme = "README.md"
+license = {file = "LICENSE"}
+keywords = ["JAX", "GPU", "Python", "Finite element analysis", "Differentiable programming"]
+classifiers = [
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Scientific/Engineering :: Physics",
+  "License :: OSI Approved :: BSD License",
+  "Natural Language :: English",
+  "Programming Language :: Python :: 3"
+]
+
+[tool.setuptools]
+packages = ["jax_fem"]
+</file>
+
+<file path="jax_fem/problem.py">
+import numpy as onp
+import jax
+import jax.numpy as np
+import jax.flatten_util
+from dataclasses import dataclass
+from typing import Any, Callable, Optional, List, Union
+import functools
+
+from jax_fem.utils import timeit 
+from jax_fem.generate_mesh import Mesh
+from jax_fem.fe import FiniteElement
+from jax_fem import logger
+
+
+@dataclass
+class Problem:
+    mesh: Mesh
+    vec: int
+    dim: int
+    ele_type: str = 'HEX8'
+    gauss_order: int = None
+    dirichlet_bc_info: Optional[List[Union[List[Callable], List[int], List[Callable]]]] = None
+    location_fns: Optional[List[Callable]] = None
+    additional_info: Any = ()
+
+    def __post_init__(self):
+
+        if type(self.mesh) != type([]):
+            self.mesh = [self.mesh]
+            self.vec = [self.vec]
+            self.ele_type = [self.ele_type]
+            self.gauss_order = [self.gauss_order]
+            self.dirichlet_bc_info = [self.dirichlet_bc_info]
+
+        self.num_vars = len(self.mesh)
+
+        self.fes = [FiniteElement(mesh=self.mesh[i], 
+                                  vec=self.vec[i], 
+                                  dim=self.dim, 
+                                  ele_type=self.ele_type[i], 
+                                  gauss_order=self.gauss_order[i] if type(self.gauss_order) == type([]) else self.gauss_order,
+                                  dirichlet_bc_info=self.dirichlet_bc_info[i] if type(self.dirichlet_bc_info) == type([]) else self.dirichlet_bc_info) \
+                    for i in range(self.num_vars)] 
+
+        self.cells_list = [fe.cells for fe in self.fes]
+        # Assume all fes have the same number of cells, same dimension
+        self.num_cells = self.fes[0].num_cells
+        self.boundary_inds_list = self.fes[0].get_boundary_conditions_inds(self.location_fns)
+
+        self.offset = [0] 
+        for i in range(len(self.fes) - 1):
+            self.offset.append(self.offset[i] + self.fes[i].num_total_dofs)
+
+        def find_ind(*x):
+            inds = []
+            for i in range(len(x)):
+                x[i].reshape(-1)
+                crt_ind = self.fes[i].vec * x[i][:, None] + np.arange(self.fes[i].vec)[None, :] + self.offset[i]
+                inds.append(crt_ind.reshape(-1))
+
+            return np.hstack(inds)
+
+        # (num_cells, num_nodes*vec + ...)
+        inds = onp.array(jax.vmap(find_ind)(*self.cells_list))
+        self.I = onp.repeat(inds[:, :, None], inds.shape[1], axis=2).reshape(-1)
+        self.J = onp.repeat(inds[:, None, :], inds.shape[1], axis=1).reshape(-1)
+        self.cells_list_face_list = []
+
+        for i, boundary_inds in enumerate(self.boundary_inds_list):
+            cells_list_face = [cells[boundary_inds[:, 0]] for cells in self.cells_list] # [(num_selected_faces, num_nodes), ...]
+            inds_face = onp.array(jax.vmap(find_ind)(*cells_list_face)) # (num_selected_faces, num_nodes*vec + ...)
+            I_face = onp.repeat(inds_face[:, :, None], inds_face.shape[1], axis=2).reshape(-1)
+            J_face = onp.repeat(inds_face[:, None, :], inds_face.shape[1], axis=1).reshape(-1)
+            self.I = onp.hstack((self.I, I_face))
+            self.J = onp.hstack((self.J, J_face))
+            self.cells_list_face_list.append(cells_list_face)
+     
+        self.cells_flat = jax.vmap(lambda *x: jax.flatten_util.ravel_pytree(x)[0])(*self.cells_list) # (num_cells, num_nodes + ...)
+
+        dumb_array_dof = [np.zeros((fe.num_nodes, fe.vec)) for fe in self.fes]
+        # TODO: dumb_array_dof is useless?
+        dumb_array_node = [np.zeros(fe.num_nodes) for fe in self.fes]
+        # _, unflatten_fn_node = jax.flatten_util.ravel_pytree(dumb_array_node)
+        _, self.unflatten_fn_dof = jax.flatten_util.ravel_pytree(dumb_array_dof)
+        
+        dumb_sol_list = [np.zeros((fe.num_total_nodes, fe.vec)) for fe in self.fes]
+        dumb_dofs, self.unflatten_fn_sol_list = jax.flatten_util.ravel_pytree(dumb_sol_list)
+        self.num_total_dofs_all_vars = len(dumb_dofs)
+
+        self.num_nodes_cumsum = onp.cumsum([0] + [fe.num_nodes for fe in self.fes])
+        # (num_cells, num_vars, num_quads)
+        self.JxW = onp.transpose(onp.stack([fe.JxW for fe in self.fes]), axes=(1, 0, 2)) 
+        # (num_cells, num_quads, num_nodes +..., dim)
+        self.shape_grads = onp.concatenate([fe.shape_grads for fe in self.fes], axis=2)
+        # (num_cells, num_quads, num_nodes + ..., 1, dim)
+        self.v_grads_JxW = onp.concatenate([fe.v_grads_JxW for fe in self.fes], axis=2)
+
+        # TODO: assert all vars quad points be the same
+        # (num_cells, num_quads, dim)
+        self.physical_quad_points = self.fes[0].get_physical_quad_points()  
+
+        self.selected_face_shape_grads = []
+        self.nanson_scale = []
+        self.selected_face_shape_vals = []
+        self.physical_surface_quad_points = []
+        for boundary_inds in self.boundary_inds_list:
+            s_shape_grads = []
+            n_scale = []
+            s_shape_vals = []
+            for fe in self.fes:
+                # (num_selected_faces, num_face_quads, num_nodes, dim), (num_selected_faces, num_face_quads)
+                face_shape_grads_physical, nanson_scale = fe.get_face_shape_grads(boundary_inds)  
+                selected_face_shape_vals = fe.face_shape_vals[boundary_inds[:, 1]]  # (num_selected_faces, num_face_quads, num_nodes)
+                s_shape_grads.append(face_shape_grads_physical)
+                n_scale.append(nanson_scale)
+                s_shape_vals.append(selected_face_shape_vals)
+
+            # (num_selected_faces, num_face_quads, num_nodes + ..., dim)
+            s_shape_grads = onp.concatenate(s_shape_grads, axis=2)
+            # (num_selected_faces, num_vars, num_face_quads)
+            n_scale = onp.transpose(onp.stack(n_scale), axes=(1, 0, 2))  
+            # (num_selected_faces, num_face_quads, num_nodes + ...)
+            s_shape_vals = onp.concatenate(s_shape_vals, axis=2)
+            # (num_selected_faces, num_face_quads, dim)
+            physical_surface_quad_points = self.fes[0].get_physical_surface_quad_points(boundary_inds) 
+
+            self.selected_face_shape_grads.append(s_shape_grads)
+            self.nanson_scale.append(n_scale)
+            self.selected_face_shape_vals.append(s_shape_vals)
+            # TODO: assert all vars face quad points be the same
+            self.physical_surface_quad_points.append(physical_surface_quad_points)
+
+        self.internal_vars = ()
+        self.internal_vars_surfaces = [() for _ in range(len(self.boundary_inds_list))]
+        self.custom_init(*self.additional_info)
+        self.pre_jit_fns()
+
+    def custom_init(self):
+        """Child class should override if more things need to be done in initialization
+        """
+        pass
+
+    def get_laplace_kernel(self, tensor_map):
+
+        def laplace_kernel(cell_sol_flat, cell_shape_grads, cell_v_grads_JxW, *cell_internal_vars):
+            # cell_sol_flat: (num_nodes*vec + ...,)
+            # cell_sol_list: [(num_nodes, vec), ...]
+            # cell_shape_grads: (num_quads, num_nodes + ..., dim)
+            # cell_v_grads_JxW: (num_quads, num_nodes + ..., 1, dim)
+
+            cell_sol_list = self.unflatten_fn_dof(cell_sol_flat)
+            cell_shape_grads = cell_shape_grads[:, :self.fes[0].num_nodes, :]
+            cell_sol = cell_sol_list[0]
+            cell_v_grads_JxW = cell_v_grads_JxW[:, :self.fes[0].num_nodes, :, :]
+            vec = self.fes[0].vec
+
+            # (1, num_nodes, vec, 1) * (num_quads, num_nodes, 1, dim) -> (num_quads, num_nodes, vec, dim)
+            u_grads = cell_sol[None, :, :, None] * cell_shape_grads[:, :, None, :]
+            u_grads = np.sum(u_grads, axis=1)  # (num_quads, vec, dim)
+            u_grads_reshape = u_grads.reshape(-1, vec, self.dim)  # (num_quads, vec, dim)
+            # (num_quads, vec, dim)
+            u_physics = jax.vmap(tensor_map)(u_grads_reshape, *cell_internal_vars).reshape(u_grads.shape)
+            # (num_quads, num_nodes, vec, dim) -> (num_nodes, vec)
+            val = np.sum(u_physics[:, None, :, :] * cell_v_grads_JxW, axis=(0, -1))
+            val = jax.flatten_util.ravel_pytree(val)[0] # (num_nodes*vec + ...,)
+            return val
+
+        return laplace_kernel
+
+    def get_mass_kernel(self, mass_map):
+
+        def mass_kernel(cell_sol_flat, x, cell_JxW, *cell_internal_vars):
+            # cell_sol_flat: (num_nodes*vec + ...,)
+            # cell_sol_list: [(num_nodes, vec), ...]
+            # x: (num_quads, dim)
+            # cell_JxW: (num_vars, num_quads)
+
+            cell_sol_list = self.unflatten_fn_dof(cell_sol_flat)
+            cell_sol = cell_sol_list[0]
+            cell_JxW = cell_JxW[0]
+            vec = self.fes[0].vec
+            # (1, num_nodes, vec) * (num_quads, num_nodes, 1) -> (num_quads, num_nodes, vec) -> (num_quads, vec)
+            u = np.sum(cell_sol[None, :, :] * self.fes[0].shape_vals[:, :, None], axis=1)
+            u_physics = jax.vmap(mass_map)(u, x, *cell_internal_vars)  # (num_quads, vec)
+            # (num_quads, 1, vec) * (num_quads, num_nodes, 1) * (num_quads, 1, 1) -> (num_nodes, vec)
+            val = np.sum(u_physics[:, None, :] * self.fes[0].shape_vals[:, :, None] * cell_JxW[:, None, None], axis=0)
+            val = jax.flatten_util.ravel_pytree(val)[0] # (num_nodes*vec + ...,)
+            return val
+
+        return mass_kernel
+
+    def get_surface_kernel(self, surface_map):
+
+        def surface_kernel(cell_sol_flat, x, face_shape_vals, face_shape_grads, face_nanson_scale, *cell_internal_vars_surface):
+            # face_shape_vals: (num_face_quads, num_nodes + ...)
+            # face_shape_grads: (num_face_quads, num_nodes + ..., dim)
+            # x: (num_face_quads, dim)
+            # face_nanson_scale: (num_vars, num_face_quads)
+
+            cell_sol_list = self.unflatten_fn_dof(cell_sol_flat)
+            cell_sol = cell_sol_list[0]
+            face_shape_vals = face_shape_vals[:, :self.fes[0].num_nodes]
+            face_nanson_scale = face_nanson_scale[0]
+
+            # (1, num_nodes, vec) * (num_face_quads, num_nodes, 1) -> (num_face_quads, vec)
+            u = np.sum(cell_sol[None, :, :] * face_shape_vals[:, :, None], axis=1)
+            u_physics = jax.vmap(surface_map)(u, x, *cell_internal_vars_surface)  # (num_face_quads, vec)
+            # (num_face_quads, 1, vec) * (num_face_quads, num_nodes, 1) * (num_face_quads, 1, 1) -> (num_nodes, vec)
+            val = np.sum(u_physics[:, None, :] * face_shape_vals[:, :, None] * face_nanson_scale[:, None, None], axis=0)
+
+            return jax.flatten_util.ravel_pytree(val)[0]
+
+        return surface_kernel
+
+    def pre_jit_fns(self):
+        def value_and_jacfwd(f, x):
+            pushfwd = functools.partial(jax.jvp, f, (x, ))
+            basis = np.eye(len(x.reshape(-1)), dtype=x.dtype).reshape(-1, *x.shape)
+            y, jac = jax.vmap(pushfwd, out_axes=(None, -1))((basis, ))
+            return y, jac
+
+        def get_kernel_fn_cell():
+            def kernel(cell_sol_flat, physical_quad_points, cell_shape_grads, cell_JxW, cell_v_grads_JxW, *cell_internal_vars):
+                """
+                universal_kernel should be able to cover all situations (including mass_kernel and laplace_kernel).
+                mass_kernel and laplace_kernel are from legacy JAX-FEM. They can still be used, but not mandatory.
+                """
+
+                # TODO: If there is no kernel map, returning 0. is not a good choice. 
+                # Return a zero array with proper shape will be better.
+                if hasattr(self, 'get_mass_map'):
+                    mass_kernel = self.get_mass_kernel(self.get_mass_map())
+                    mass_val = mass_kernel(cell_sol_flat, physical_quad_points, cell_JxW, *cell_internal_vars)
+                else:
+                    mass_val = 0.
+
+                if hasattr(self, 'get_tensor_map'):
+                    laplace_kernel = self.get_laplace_kernel(self.get_tensor_map())
+                    laplace_val = laplace_kernel(cell_sol_flat, cell_shape_grads, cell_v_grads_JxW, *cell_internal_vars)
+                else:
+                    laplace_val = 0.
+
+                if hasattr(self, 'get_universal_kernel'):
+                    universal_kernel = self.get_universal_kernel()
+                    universal_val = universal_kernel(cell_sol_flat, physical_quad_points, cell_shape_grads, cell_JxW, 
+                        cell_v_grads_JxW, *cell_internal_vars)
+                else:
+                    universal_val = 0.
+
+                return laplace_val + mass_val + universal_val
+
+
+            def kernel_jac(cell_sol_flat, *args):
+                kernel_partial = lambda cell_sol_flat: kernel(cell_sol_flat, *args)
+                return value_and_jacfwd(kernel_partial, cell_sol_flat)  # kernel(cell_sol_flat, *args), jax.jacfwd(kernel)(cell_sol_flat, *args)
+
+            return kernel, kernel_jac
+
+        def get_kernel_fn_face(ind):
+            def kernel(cell_sol_flat, physical_surface_quad_points, face_shape_vals, face_shape_grads, face_nanson_scale, *cell_internal_vars_surface):
+                """
+                universal_kernel should be able to cover all situations (including surface_kernel).
+                surface_kernel is from legacy JAX-FEM. It can still be used, but not mandatory.
+                """
+                if hasattr(self, 'get_surface_maps'):
+                    surface_kernel = self.get_surface_kernel(self.get_surface_maps()[ind])
+                    surface_val = surface_kernel(cell_sol_flat, physical_surface_quad_points, face_shape_vals,
+                        face_shape_grads, face_nanson_scale, *cell_internal_vars_surface)
+                else:
+                    surface_val = 0.
+
+                if hasattr(self, 'get_universal_kernels_surface'):
+                    universal_kernel = self.get_universal_kernels_surface()[ind]
+                    universal_val = universal_kernel(cell_sol_flat, physical_surface_quad_points, face_shape_vals,
+                        face_shape_grads, face_nanson_scale, *cell_internal_vars_surface)
+                else:
+                    universal_val = 0.
+
+                return surface_val + universal_val
+
+            def kernel_jac(cell_sol_flat, *args):
+                # return jax.jacfwd(kernel)(cell_sol_flat, *args)
+                kernel_partial = lambda cell_sol_flat: kernel(cell_sol_flat, *args)
+                return value_and_jacfwd(kernel_partial, cell_sol_flat)  # kernel(cell_sol_flat, *args), jax.jacfwd(kernel)(cell_sol_flat, *args)
+
+            return kernel, kernel_jac
+
+        kernel, kernel_jac = get_kernel_fn_cell()
+        kernel = jax.jit(jax.vmap(kernel))
+        kernel_jac = jax.jit(jax.vmap(kernel_jac))
+        self.kernel = kernel
+        self.kernel_jac = kernel_jac
+
+        num_surfaces = len(self.boundary_inds_list)
+        if hasattr(self, 'get_surface_maps'):
+            assert num_surfaces == len(self.get_surface_maps())
+        elif hasattr(self, 'get_universal_kernels_surface'):
+            assert num_surfaces == len(self.get_universal_kernels_surface()) 
+        else:
+            assert num_surfaces == 0, "Missing definitions for surface integral"
+            
+
+        self.kernel_face = []
+        self.kernel_jac_face = []
+        for i in range(len(self.boundary_inds_list)):
+            kernel_face, kernel_jac_face = get_kernel_fn_face(i)
+            kernel_face = jax.jit(jax.vmap(kernel_face))
+            kernel_jac_face = jax.jit(jax.vmap(kernel_jac_face))
+            self.kernel_face.append(kernel_face)
+            self.kernel_jac_face.append(kernel_jac_face)
+
+    @timeit
+    def split_and_compute_cell(self, cells_sol_flat, np_version, jac_flag, internal_vars):
+        """Volume integral in weak form
+        """
+        vmap_fn = self.kernel_jac if jac_flag else self.kernel
+        num_cuts = 20
+        if num_cuts > self.num_cells:
+            num_cuts = self.num_cells
+        batch_size = self.num_cells // num_cuts
+        input_collection = [cells_sol_flat, self.physical_quad_points, self.shape_grads, self.JxW, self.v_grads_JxW, *internal_vars]
+
+        if jac_flag:
+            values = []
+            jacs = []
+            for i in range(num_cuts):
+                if i < num_cuts - 1:
+                    input_col = jax.tree_map(lambda x: x[i * batch_size:(i + 1) * batch_size], input_collection)
+                else:
+                    input_col = jax.tree_map(lambda x: x[i * batch_size:], input_collection)
+
+                val, jac = vmap_fn(*input_col)
+                values.append(val)
+                jacs.append(jac)
+            values = np_version.vstack(values)
+            jacs = np_version.vstack(jacs)
+
+            return values, jacs
+        else:
+            values = []
+            for i in range(num_cuts):
+                if i < num_cuts - 1:
+                    input_col = jax.tree_map(lambda x: x[i * batch_size:(i + 1) * batch_size], input_collection)
+                else:
+                    input_col = jax.tree_map(lambda x: x[i * batch_size:], input_collection)
+
+                val = vmap_fn(*input_col)
+                values.append(val)
+            values = np_version.vstack(values)
+            return values
+
+    def compute_face(self, cells_sol_flat, np_version, jac_flag, internal_vars_surfaces):
+        """Surface integral in weak form
+        """
+        if jac_flag:
+            values = []
+            jacs = []
+            for i, boundary_inds in enumerate(self.boundary_inds_list):
+                vmap_fn = self.kernel_jac_face[i]
+                selected_cell_sols_flat = cells_sol_flat[boundary_inds[:, 0]]  # (num_selected_faces, num_nodes*vec + ...))
+                input_collection = [selected_cell_sols_flat, self.physical_surface_quad_points[i], self.selected_face_shape_vals[i], 
+                                    self.selected_face_shape_grads[i], self.nanson_scale[i], *internal_vars_surfaces[i]]
+
+                val, jac = vmap_fn(*input_collection)
+                values.append(val)
+                jacs.append(jac)
+            return values, jacs
+        else:
+            values = []
+            for i, boundary_inds in enumerate(self.boundary_inds_list):
+                vmap_fn = self.kernel_face[i]
+                selected_cell_sols_flat = cells_sol_flat[boundary_inds[:, 0]]  # (num_selected_faces, num_nodes*vec + ...))
+                # TODO: duplicated code
+                input_collection = [selected_cell_sols_flat, self.physical_surface_quad_points[i], self.selected_face_shape_vals[i], 
+                                    self.selected_face_shape_grads[i], self.nanson_scale[i], *internal_vars_surfaces[i]]
+                val = vmap_fn(*input_collection)
+                values.append(val)
+            return values
+
+    def compute_residual_vars_helper(self, weak_form_flat, weak_form_face_flat):
+        res_list = [np.zeros((fe.num_total_nodes, fe.vec)) for fe in self.fes]
+        weak_form_list = jax.vmap(lambda x: self.unflatten_fn_dof(x))(weak_form_flat) # [(num_cells, num_nodes, vec), ...]
+        res_list = [res_list[i].at[self.cells_list[i].reshape(-1)].add(weak_form_list[i].reshape(-1, 
+            self.fes[i].vec)) for i in range(self.num_vars)]
+
+        for ind, cells_list_face in enumerate(self.cells_list_face_list):
+            weak_form_face_list = jax.vmap(lambda x: self.unflatten_fn_dof(x))(weak_form_face_flat[ind]) # [(num_selected_faces, num_nodes, vec), ...]
+            res_list = [res_list[i].at[cells_list_face[i].reshape(-1)].add(weak_form_face_list[i].reshape(-1, 
+                self.fes[i].vec)) for i in range(self.num_vars)]   
+
+        return res_list
+
+    def compute_residual_vars(self, sol_list, internal_vars, internal_vars_surfaces):
+        logger.debug(f"Computing cell residual...")
+        cells_sol_list = [sol[cells] for cells, sol in zip(self.cells_list, sol_list)] # [(num_cells, num_nodes, vec), ...]
+        cells_sol_flat = jax.vmap(lambda *x: jax.flatten_util.ravel_pytree(x)[0])(*cells_sol_list) # (num_cells, num_nodes*vec + ...)
+        weak_form_flat = self.split_and_compute_cell(cells_sol_flat, np, False, internal_vars)  # (num_cells, num_nodes*vec + ...)
+        weak_form_face_flat = self.compute_face(cells_sol_flat, np, False, internal_vars_surfaces)  # [(num_selected_faces, num_nodes*vec + ...), ...]
+        return self.compute_residual_vars_helper(weak_form_flat, weak_form_face_flat)
+
+    def compute_newton_vars(self, sol_list, internal_vars, internal_vars_surfaces):
+        logger.debug(f"Computing cell Jacobian and cell residual...")
+        cells_sol_list = [sol[cells] for cells, sol in zip(self.cells_list, sol_list)] # [(num_cells, num_nodes, vec), ...]
+        cells_sol_flat = jax.vmap(lambda *x: jax.flatten_util.ravel_pytree(x)[0])(*cells_sol_list) # (num_cells, num_nodes*vec + ...)
+        # (num_cells, num_nodes*vec + ...),  (num_cells, num_nodes*vec + ..., num_nodes*vec + ...)
+        weak_form_flat, cells_jac_flat = self.split_and_compute_cell(cells_sol_flat, onp, True, internal_vars)
+        self.V = onp.array(cells_jac_flat.reshape(-1))
+
+        # [(num_selected_faces, num_nodes*vec + ...,), ...], [(num_selected_faces, num_nodes*vec + ..., num_nodes*vec + ...,), ...]
+        weak_form_face_flat, cells_jac_face_flat = self.compute_face(cells_sol_flat, onp, True, internal_vars_surfaces)
+        for cells_jac_f_flat in cells_jac_face_flat:
+            self.V = onp.hstack((self.V, onp.array(cells_jac_f_flat.reshape(-1))))
+
+        return self.compute_residual_vars_helper(weak_form_flat, weak_form_face_flat)
+
+    def compute_residual(self, sol_list):
+        return self.compute_residual_vars(sol_list, self.internal_vars, self.internal_vars_surfaces)
+
+    def newton_update(self, sol_list):
+        return self.compute_newton_vars(sol_list, self.internal_vars, self.internal_vars_surfaces)
+
+    def set_params(self, params):
+        """Used for solving inverse problems.
+        """
+        raise NotImplementedError("Child class must implement this function!")
+</file>
+
+<file path=".gitignore">
+.vscode/launch.json
+*.pyc
+
+dev_code/
+*reference/
+*.DS_Store
+*data/
+*output/
+*defcon/
+*debug/
+tests/benchmarks/*/jax_fem/*
+applications/aesthetic/input/models
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+</file>
+
+<file path="environment.yml">
+name: jax-fem-env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python==3.9.18
+  - numpy==1.24.4
+  - scipy==1.11.3
+  - matplotlib==3.8.0
+  - meshio==5.3.4
+  - petsc4py==3.20.0
+  - pip==23.2.1
+  - fenics==2019.1.0
+  - pip:
+    - setuptools==68.2
+    - wheel==0.41
+    - gmsh==4.11.1
+    - fenics-basix==0.6.0
+    - pyfiglet==1.0
+</file>
+
+<file path="jax_fem/fe.py">
+import numpy as onp
+import jax
+import jax.numpy as np
+import sys
+import time
+import functools
+from dataclasses import dataclass
+from typing import Any, Callable, Optional, List, Union
+from jax_fem.generate_mesh import Mesh
+from jax_fem.basis import get_face_shape_vals_and_grads, get_shape_vals_and_grads
+from jax_fem import logger
+
+
+onp.set_printoptions(threshold=sys.maxsize,
+                     linewidth=1000,
+                     suppress=True,
+                     precision=5)
+
+
+@dataclass
+class FiniteElement:
+    """
+    Defines finite element related to one variable (can be vector valued)
+
+    Attributes
+    ----------
+    mesh : Mesh object
+        The mesh object stores points (coordinates) and cells (connectivity).
+    vec : int
+        The number of vector variable components of the solution.
+        E.g., a 3D displacement field has u_x, u_y and u_z components, so vec=3
+    dim : int
+        The dimension of the problem.
+    ele_type : str
+        Element type
+    dirichlet_bc_info : [location_fns, vecs, value_fns]
+        location_fns : List[Callable]
+            Callable : a function that inputs a point and returns if the point satisfies the location condition
+        vecs: List[int]
+            integer value must be in the range of 0 to vec - 1,
+            specifying which component of the (vector) variable to apply Dirichlet condition to
+        value_fns : List[Callable]
+            Callable : a function that inputs a point and returns the Dirichlet value
+    periodic_bc_info : [location_fns_A, location_fns_B, mappings, vecs]
+        location_fns_A : List[Callable]
+            Callable : location function for boundary A
+        location_fns_B : List[Callable]
+            Callable : location function for boundary B
+        mappings : List[Callable]
+            Callable: function mapping a point from boundary A to boundary B
+        vecs: List[int]
+            which component of the (vector) variable to apply periodic condition to
+    """
+    mesh: Mesh
+    vec: int
+    dim: int
+    ele_type: str
+    gauss_order: int
+    dirichlet_bc_info: Optional[List[Union[List[Callable], List[int], List[Callable]]]]
+    periodic_bc_info: Optional[List[Union[List[Callable], List[Callable], List[Callable], List[int]]]] = None
+
+    def __post_init__(self):
+        self.points = self.mesh.points
+        self.cells = self.mesh.cells
+        self.num_cells = len(self.cells)
+        self.num_total_nodes = len(self.mesh.points)
+        self.num_total_dofs = self.num_total_nodes * self.vec
+
+        start = time.time()
+        logger.debug(f"Computing shape function values, gradients, etc.")
+
+        self.shape_vals, self.shape_grads_ref, self.quad_weights = get_shape_vals_and_grads(self.ele_type, self.gauss_order)
+        self.face_shape_vals, self.face_shape_grads_ref, self.face_quad_weights, self.face_normals, self.face_inds \
+        = get_face_shape_vals_and_grads(self.ele_type, self.gauss_order)
+        self.num_quads = self.shape_vals.shape[0]
+        self.num_nodes = self.shape_vals.shape[1]
+        self.num_faces = self.face_shape_vals.shape[0]
+        self.shape_grads, self.JxW = self.get_shape_grads()
+        self.node_inds_list, self.vec_inds_list, self.vals_list = self.Dirichlet_boundary_conditions(self.dirichlet_bc_info)
+        
+        # self.p_node_inds_list_A, self.p_node_inds_list_B, self.p_vec_inds_list = self.periodic_boundary_conditions()
+
+        # (num_cells, num_quads, num_nodes, 1, dim)
+        self.v_grads_JxW = self.shape_grads[:, :, :, None, :] * self.JxW[:, :, None, None, None]
+        self.num_face_quads = self.face_quad_weights.shape[1]
+
+        end = time.time()
+        compute_time = end - start
+
+        logger.debug(f"Done pre-computations, took {compute_time} [s]")
+        logger.info(f"Solving a problem with {len(self.cells)} cells, {self.num_total_nodes}x{self.vec} = {self.num_total_dofs} dofs.")
+
+    def get_shape_grads(self):
+        """Compute shape function gradient value
+        The gradient is w.r.t physical coordinates.
+        See Hughes, Thomas JR. The finite element method: linear static and dynamic finite element analysis. Courier Corporation, 2012.
+        Page 147, Eq. (3.9.3)
+
+        Returns
+        -------
+        shape_grads_physical : onp.ndarray
+            (num_cells, num_quads, num_nodes, dim)
+        JxW : onp.ndarray
+            (num_cells, num_quads)
+        """
+        assert self.shape_grads_ref.shape == (self.num_quads, self.num_nodes, self.dim)
+        physical_coos = onp.take(self.points, self.cells, axis=0)  # (num_cells, num_nodes, dim)
+        # (num_cells, num_quads, num_nodes, dim, dim) -> (num_cells, num_quads, 1, dim, dim)
+        jacobian_dx_deta = onp.sum(physical_coos[:, None, :, :, None] *
+                                   self.shape_grads_ref[None, :, :, None, :], axis=2, keepdims=True)
+        jacobian_det = onp.linalg.det(jacobian_dx_deta)[:, :, 0]  # (num_cells, num_quads)
+        jacobian_deta_dx = onp.linalg.inv(jacobian_dx_deta)
+        # (1, num_quads, num_nodes, 1, dim) @ (num_cells, num_quads, 1, dim, dim)
+        # (num_cells, num_quads, num_nodes, 1, dim) -> (num_cells, num_quads, num_nodes, dim)
+        shape_grads_physical = (self.shape_grads_ref[None, :, :, None, :]
+                                @ jacobian_deta_dx)[:, :, :, 0, :]
+        JxW = jacobian_det * self.quad_weights[None, :]
+        return shape_grads_physical, JxW
+
+    def get_face_shape_grads(self, boundary_inds):
+        """Face shape function gradients and JxW (for surface integral)
+        Nanson's formula is used to map physical surface ingetral to reference domain
+        Reference: https://en.wikiversity.org/wiki/Continuum_mechanics/Volume_change_and_area_change
+
+        Parameters
+        ----------
+        boundary_inds : List[onp.ndarray]
+            (num_selected_faces, 2)
+
+        Returns
+        -------
+        face_shape_grads_physical : onp.ndarray
+            (num_selected_faces, num_face_quads, num_nodes, dim)
+        nanson_scale : onp.ndarray
+            (num_selected_faces, num_face_quads)
+        """
+        physical_coos = onp.take(self.points, self.cells, axis=0)  # (num_cells, num_nodes, dim)
+        selected_coos = physical_coos[boundary_inds[:, 0]]  # (num_selected_faces, num_nodes, dim)
+        selected_f_shape_grads_ref = self.face_shape_grads_ref[boundary_inds[:, 1]]  # (num_selected_faces, num_face_quads, num_nodes, dim)
+        selected_f_normals = self.face_normals[boundary_inds[:, 1]]  # (num_selected_faces, dim)
+
+        # (num_selected_faces, 1, num_nodes, dim, 1) * (num_selected_faces, num_face_quads, num_nodes, 1, dim)
+        # (num_selected_faces, num_face_quads, num_nodes, dim, dim) -> (num_selected_faces, num_face_quads, dim, dim)
+        jacobian_dx_deta = onp.sum(selected_coos[:, None, :, :, None] * selected_f_shape_grads_ref[:, :, :, None, :], axis=2)
+        jacobian_det = onp.linalg.det(jacobian_dx_deta)  # (num_selected_faces, num_face_quads)
+        jacobian_deta_dx = onp.linalg.inv(jacobian_dx_deta)  # (num_selected_faces, num_face_quads, dim, dim)
+
+        # (1, num_face_quads, num_nodes, 1, dim) @ (num_selected_faces, num_face_quads, 1, dim, dim)
+        # (num_selected_faces, num_face_quads, num_nodes, 1, dim) -> (num_selected_faces, num_face_quads, num_nodes, dim)
+        face_shape_grads_physical = (selected_f_shape_grads_ref[:, :, :, None, :] @ jacobian_deta_dx[:, :, None, :, :])[:, :, :, 0, :]
+
+        # (num_selected_faces, 1, 1, dim) @ (num_selected_faces, num_face_quads, dim, dim)
+        # (num_selected_faces, num_face_quads, 1, dim) -> (num_selected_faces, num_face_quads)
+        nanson_scale = onp.linalg.norm((selected_f_normals[:, None, None, :] @ jacobian_deta_dx)[:, :, 0, :], axis=-1)
+        selected_weights = self.face_quad_weights[boundary_inds[:, 1]]  # (num_selected_faces, num_face_quads)
+        nanson_scale = nanson_scale * jacobian_det * selected_weights
+        return face_shape_grads_physical, nanson_scale
+
+    def get_physical_quad_points(self):
+        """Compute physical quadrature points
+
+        Returns
+        -------
+        physical_quad_points : onp.ndarray
+            (num_cells, num_quads, dim)
+        """
+        physical_coos = onp.take(self.points, self.cells, axis=0)
+        # (1, num_quads, num_nodes, 1) * (num_cells, 1, num_nodes, dim) -> (num_cells, num_quads, dim)
+        physical_quad_points = onp.sum(self.shape_vals[None, :, :, None] * physical_coos[:, None, :, :], axis=2)
+        return physical_quad_points
+
+    def get_physical_surface_quad_points(self, boundary_inds):
+        """Compute physical quadrature points on the surface
+
+        Parameters
+        ----------
+        boundary_inds : List[onp.ndarray]
+            ndarray shape: (num_selected_faces, 2)
+
+        Returns
+        -------
+        physical_surface_quad_points : ndarray
+            (num_selected_faces, num_face_quads, dim)
+        """
+        physical_coos = onp.take(self.points, self.cells, axis=0)
+        selected_coos = physical_coos[boundary_inds[:, 0]]  # (num_selected_faces, num_nodes, dim)
+        selected_face_shape_vals = self.face_shape_vals[boundary_inds[:, 1]]  # (num_selected_faces, num_face_quads, num_nodes)
+        # (num_selected_faces, num_face_quads, num_nodes, 1) * (num_selected_faces, 1, num_nodes, dim) -> (num_selected_faces, num_face_quads, dim)
+        physical_surface_quad_points = onp.sum(selected_face_shape_vals[:, :, :, None] * selected_coos[:, None, :, :], axis=2)
+        return physical_surface_quad_points
+
+    def Dirichlet_boundary_conditions(self, dirichlet_bc_info):
+        """Indices and values for Dirichlet B.C.
+
+        Parameters
+        ----------
+        dirichlet_bc_info : [location_fns, vecs, value_fns]
+
+        Returns
+        -------
+        node_inds_List : List[onp.ndarray]
+            The ndarray ranges from 0 to num_total_nodes - 1
+        vec_inds_List : List[onp.ndarray]
+            The ndarray ranges from 0 to to vec - 1
+        vals_List : List[ndarray]
+            Dirichlet values to be assigned
+        """
+        node_inds_list = []
+        vec_inds_list = []
+        vals_list = []
+        if dirichlet_bc_info is not None:
+            location_fns, vecs, value_fns = dirichlet_bc_info
+            assert len(location_fns) == len(value_fns) and len(value_fns) == len(vecs)
+            for i in range(len(location_fns)):
+                num_args = location_fns[i].__code__.co_argcount
+                if num_args == 1:
+                    location_fn = lambda point, ind: location_fns[i](point)
+                elif num_args == 2:
+                    location_fn = location_fns[i]
+                else:
+                    raise ValueError(f"Wrong number of arguments for location_fn: must be 1 or 2, get {num_args}")
+
+                node_inds = onp.argwhere(jax.vmap(location_fn)(self.mesh.points, np.arange(self.num_total_nodes))).reshape(-1)
+                vec_inds = onp.ones_like(node_inds, dtype=onp.int32) * vecs[i]
+                values = jax.vmap(value_fns[i])(self.mesh.points[node_inds].reshape(-1, self.dim)).reshape(-1)
+                node_inds_list.append(node_inds)
+                vec_inds_list.append(vec_inds)
+                vals_list.append(values)
+        return node_inds_list, vec_inds_list, vals_list
+
+    def update_Dirichlet_boundary_conditions(self, dirichlet_bc_info):
+        """Reset Dirichlet boundary conditions.
+        Useful when a time-dependent problem is solved, and at each iteration the boundary condition needs to be updated.
+
+        Parameters
+        ----------
+        dirichlet_bc_info : [location_fns, vecs, value_fns]
+        """
+        self.node_inds_list, self.vec_inds_list, self.vals_list = self.Dirichlet_boundary_conditions(dirichlet_bc_info)
+
+    def get_boundary_conditions_inds(self, location_fns):
+        """Given location functions, compute which faces satisfy the condition.
+
+        Parameters
+        ----------
+        location_fns : List[Callable]
+            Callable: a location function that inputs a point (ndarray) and returns if the point satisfies the location condition
+                      e.g., lambda x: np.isclose(x[0], 0.)
+                      If this location function takes 2 arguments, then the first is point and the second is index.
+                      e.g., lambda x, ind: np.isclose(x[0], 0.) & np.isin(ind, np.array([1, 3, 10]))
+
+        Returns
+        -------
+        boundary_inds_list : List[onp.ndarray]
+            (num_selected_faces, 2)
+            boundary_inds_list[k][i, 0] returns the global cell index of the ith selected face of boundary subset k
+            boundary_inds_list[k][i, 1] returns the local face index of the ith selected face of boundary subset k
+        """
+        # TODO: assume this works for all variables, and return the same result
+        cell_points = onp.take(self.points, self.cells, axis=0)  # (num_cells, num_nodes, dim)
+        cell_face_points = onp.take(cell_points, self.face_inds, axis=1)  # (num_cells, num_faces, num_face_vertices, dim)
+        cell_face_inds = onp.take(self.cells, self.face_inds, axis=1) # (num_cells, num_faces, num_face_vertices)
+        boundary_inds_list = []
+        if location_fns is not None:
+            for i in range(len(location_fns)):
+                num_args = location_fns[i].__code__.co_argcount
+                if num_args == 1:
+                    location_fn = lambda point, ind: location_fns[i](point)
+                elif num_args == 2:
+                    location_fn = location_fns[i]
+                else:
+                    raise ValueError(f"Wrong number of arguments for location_fn: must be 1 or 2, get {num_args}")
+
+                vmap_location_fn = jax.vmap(location_fn)
+                def on_boundary(cell_points, cell_inds):
+                    boundary_flag = vmap_location_fn(cell_points, cell_inds)
+                    return onp.all(boundary_flag)
+
+                vvmap_on_boundary = jax.vmap(jax.vmap(on_boundary))
+                boundary_flags = vvmap_on_boundary(cell_face_points, cell_face_inds)
+                boundary_inds = onp.argwhere(boundary_flags)  # (num_selected_faces, 2)
+                boundary_inds_list.append(boundary_inds)
+
+        return boundary_inds_list
+
+    def convert_from_dof_to_quad(self, sol):
+        """Obtain quad values from nodal solution
+
+        Parameters
+        ----------
+        sol : np.DeviceArray
+            (num_total_nodes, vec)
+
+        Returns
+        -------
+        u : np.DeviceArray
+            (num_cells, num_quads, vec)
+        """
+        # (num_total_nodes, vec) -> (num_cells, num_nodes, vec)
+        cells_sol = sol[self.cells]
+        # (num_cells, 1, num_nodes, vec) * (1, num_quads, num_nodes, 1) -> (num_cells, num_quads, num_nodes, vec) -> (num_cells, num_quads, vec)
+        u = np.sum(cells_sol[:, None, :, :] * self.shape_vals[None, :, :, None], axis=2)
+        return u
+
+    def convert_from_dof_to_face_quad(self, sol, boundary_inds):
+        """Obtain surface solution from nodal solution
+
+        Parameters
+        ----------
+        sol : np.DeviceArray
+            (num_total_nodes, vec)
+        boundary_inds : int
+
+        Returns
+        -------
+        u : np.DeviceArray
+            (num_selected_faces, num_face_quads, vec)
+        """
+        cells_old_sol = sol[self.cells]  # (num_cells, num_nodes, vec)
+        selected_cell_sols = cells_old_sol[boundary_inds[:, 0]]  # (num_selected_faces, num_nodes, vec))
+        selected_face_shape_vals = self.face_shape_vals[boundary_inds[:, 1]]  # (num_selected_faces, num_face_quads, num_nodes)
+        # (num_selected_faces, 1, num_nodes, vec) * (num_selected_faces, num_face_quads, num_nodes, 1) 
+        # -> (num_selected_faces, num_face_quads, vec)
+        u = np.sum(selected_cell_sols[:, None, :, :] * selected_face_shape_vals[:, :, :, None], axis=2)
+        return u
+
+    def sol_to_grad(self, sol):
+        """Obtain solution gradient from nodal solution
+
+        Parameters
+        ----------
+        sol : np.DeviceArray
+            (num_total_nodes, vec)
+
+        Returns
+        -------
+        u_grads : np.DeviceArray
+            (num_cells, num_quads, vec, dim)
+        """
+        # (num_cells, 1, num_nodes, vec, 1) * (num_cells, num_quads, num_nodes, 1, dim) -> (num_cells, num_quads, num_nodes, vec, dim)
+        u_grads = np.take(sol, self.cells, axis=0)[:, None, :, :, None] * self.shape_grads[:, :, :, None, :]
+        u_grads = np.sum(u_grads, axis=2)  # (num_cells, num_quads, vec, dim)
+        return u_grads
+
+    def print_BC_info(self):
+        """Print boundary condition information for debugging purposes.
+
+        TODO: Not working
+        """
+        if hasattr(self, 'neumann_boundary_inds_list'):
+            print(f"\n\n### Neumann B.C. is specified")
+            for i in range(len(self.neumann_boundary_inds_list)):
+                print(f"\nNeumann Boundary part {i + 1} information:")
+                print(self.neumann_boundary_inds_list[i])
+                print(
+                    f"Array.shape = (num_selected_faces, 2) = {self.neumann_boundary_inds_list[i].shape}"
+                )
+                print(f"Interpretation:")
+                print(
+                    f"    Array[i, 0] returns the global cell index of the ith selected face"
+                )
+                print(
+                    f"    Array[i, 1] returns the local face index of the ith selected face"
+                )
+        else:
+            print(f"\n\n### No Neumann B.C. found.")
+
+        if len(self.node_inds_list) != 0:
+            print(f"\n\n### Dirichlet B.C. is specified")
+            for i in range(len(self.node_inds_list)):
+                print(f"\nDirichlet Boundary part {i + 1} information:")
+                bc_array = onp.stack([
+                    self.node_inds_list[i], self.vec_inds_list[i],
+                    self.vals_list[i]
+                ]).T
+                print(bc_array)
+                print(
+                    f"Array.shape = (num_selected_dofs, 3) = {bc_array.shape}")
+                print(f"Interpretation:")
+                print(
+                    f"    Array[i, 0] returns the node index of the ith selected dof"
+                )
+                print(
+                    f"    Array[i, 1] returns the vec index of the ith selected dof"
+                )
+                print(
+                    f"    Array[i, 2] returns the value assigned to ith selected dof"
+                )
+        else:
+            print(f"\n\n### No Dirichlet B.C. found.")
+</file>
+
+<file path="README.md">
+A GPU-accelerated differentiable finite element analysis package based on [JAX](https://github.com/google/jax). Used to be part of the suite of open-source python packages for Additive Manufacturing (AM) research, [JAX-AM](https://github.com/tianjuxue/jax-am).
+
+## Finite Element Method (FEM)
+![Github Star](https://img.shields.io/github/stars/deepmodeling/jax-fem)
+![Github Fork](https://img.shields.io/github/forks/deepmodeling/jax-fem)
+![License](https://img.shields.io/github/license/deepmodeling/jax-fem)
+
+FEM is a powerful tool, where we support the following features
+
+- 2D quadrilateral/triangle elements
+- 3D hexahedron/tetrahedron elements
+- First and second order elements
+- Dirichlet/Neumann/Robin boundary conditions
+- Linear and nonlinear analysis including
+  - Heat equation
+  - Linear elasticity
+  - Hyperelasticity
+  - Plasticity (macro and crystal plasticity)
+- Differentiable simulation for solving inverse/design problems __without__ deriving sensitivities by hand, e.g.,
+  - Topology optimization
+  - Optimal thermal control
+- Integration with PETSc for solver choices
+
+**Updates** (Dec 11, 2023):
+
+- We now support multi-physics problems in the sense that multiple variables can be solved monolithically. For example, consider running  `python -m applications.stokes.example`
+- Weak form is now defined through  volume integral and surface integral. We can now treat body force, "mass kernel" and "Laplace kernel" in a unified way through volume integral, and treat "Neumann B.C." and "Robin B.C." in a unified way through surface integral. 
+
+<p align="middle">
+  <img src="images/ded.gif" width="600" />
+</p>
+<p align="middle">
+    <em >Thermal profile in direct energy deposition.</em>
+</p>
+
+<p align="middle">
+  <img src="images/von_mises.png" width="400" />
+</p>
+<p align="middle">
+    <em >Linear static analysis of a bracket.</em>
+</p>
+
+<p align="middle">
+  <img src="images/polycrystal_grain.gif" width="360" />
+  <img src="images/polycrystal_stress.gif" width="360" />
+</p>
+<p align="middle">
+    <em >Crystal plasticity: grain structure (left) and stress-xx (right).</em>
+</p>
+
+<p align="middle">
+  <img src="images/stokes_u.png" width="360" />
+  <img src="images/stokes_p.png" width="360" />
+</p>
+<p align="middle">
+    <em >Stokes flow: velocity (left) and pressure(right).</em>
+</p>
+
+<p align="middle">
+  <img src="images/to.gif" width="600" />
+</p>
+<p align="middle">
+    <em >Topology optimization with differentiable simulation.</em>
+</p>
+
+## Installation
+
+Create a conda environment from the given [`environment.yml`](https://github.com/deepmodeling/jax-fem/blob/main/environment.yml) file and activate it:
+
+```bash
+conda env create -f environment.yml
+conda activate jax-fem-env
+```
+
+Install JAX
+- See jax installation [instructions](https://github.com/jax-ml/jax?tab=readme-ov-file#installation). Depending on your hardware, you may install the CPU or GPU version of JAX. Both will work, while GPU version usually gives better performance.
+
+
+Then there are two options to continue:
+
+### Option 1
+
+Clone the repository:
+
+```bash
+git clone https://github.com/deepmodeling/jax-fem.git
+cd jax-fem
+```
+
+and install the package locally:
+
+```bash
+
+pip install -e .
+```
+
+**Quick tests**: You can check `demos/` for a variety of FEM cases. For example, run
+
+```bash
+python -m demos.hyperelasticity.example
+```
+
+for hyperelasticity. 
+
+Also, 
+
+```bash
+python -m tests.benchmarks
+```
+
+will execute a set of test cases.
+
+
+### Option 2
+
+Install the package from the [PyPI release](https://pypi.org/project/jax-fem/) directly:
+
+```bash
+pip install jax-fem
+```
+
+**Quick tests**: You can create an `example.py` file and run it:
+
+```bash
+python example.py
+```
+
+```python
+import jax
+import jax.numpy as np
+import os
+
+from jax_fem.problem import Problem
+from jax_fem.solver import solver
+from jax_fem.utils import save_sol
+from jax_fem.generate_mesh import get_meshio_cell_type, Mesh, rectangle_mesh
+
+class Poisson(Problem):
+    def get_tensor_map(self):
+        return lambda x: x
+
+    def get_mass_map(self):
+        def mass_map(u, x):
+            val = -np.array([10*np.exp(-(np.power(x[0] - 0.5, 2) + np.power(x[1] - 0.5, 2)) / 0.02)])
+            return val
+        return mass_map
+
+ele_type = 'QUAD4'
+cell_type = get_meshio_cell_type(ele_type)
+Lx, Ly = 1., 1.
+meshio_mesh = rectangle_mesh(Nx=32, Ny=32, domain_x=Lx, domain_y=Ly)
+mesh = Mesh(meshio_mesh.points, meshio_mesh.cells_dict[cell_type])
+
+def left(point):
+    return np.isclose(point[0], 0., atol=1e-5)
+
+def right(point):
+    return np.isclose(point[0], Lx, atol=1e-5)
+
+def bottom(point):
+    return np.isclose(point[1], 0., atol=1e-5)
+
+def top(point):
+    return np.isclose(point[1], Ly, atol=1e-5)
+
+def dirichlet_val(point):
+    return 0.
+
+location_fns = [left, right, bottom, top]
+value_fns = [dirichlet_val]*4
+vecs = [0]*4
+dirichlet_bc_info = [location_fns, vecs, value_fns]
+
+problem = Poisson(mesh=mesh, vec=1, dim=2, ele_type=ele_type, dirichlet_bc_info=dirichlet_bc_info)
+sol = solver(problem)
+
+data_dir = os.path.join(os.path.dirname(__file__), 'data')
+vtk_path = os.path.join(data_dir, f'vtk/u.vtu')
+save_sol(problem.fes[0], sol[0], vtk_path)
+```
+
+By running the code above and use [Paraview](https://www.paraview.org/) for visualization, you should see the following solution.
+
+<p align="middle">
+  <img src="images/poisson.png" width="400" />
+</p>
+<p align="middle">
+    <em >Solution to the Poisson's equation due to a source term.</em>
+</p>
+
+## Tutorial
+
+| Example                                                      | Highlight                                                    |
+| ------------------------------------------------------------ | ------------------------------------------------------------ |
+| [poisson](https://github.com/deepmodeling/jax-fem/tree/main/demos/poisson) | $${\color{green}Basics:}$$  Poisson's equation in a unit square domain with Dirichlet and Neumann boundary conditions, as well as a source term. |
+| [linear_elasticity](https://github.com/deepmodeling/jax-fem/tree/main/demos/linear_elasticity) | $${\color{green}Basics:}$$  Bending of a linear elastic beam due to Dirichlet and Neumann boundary conditions. Second order tetrahedral element (TET10) is used. |
+| [hyperelasticity](https://github.com/deepmodeling/jax-fem/tree/main/demos/hyperelasticity) | $${\color{blue}Nonlinear \space Constitutive \space Law:}$$ Deformation of a hyperelastic cube due to Dirichlet boundary conditions. |
+| [plasticity](https://github.com/deepmodeling/jax-fem/tree/main/demos/plasticity) | $${\color{blue}Nonlinear \space Constitutive \space Law:}$$ Perfect J2-plasticity model is implemented for small deformation theory. |
+| [phase_field_fracture](https://github.com/deepmodeling/jax-fem/tree/main/demos/phase_field_fracture) | $${\color{orange}Multi-physics \space Coupling:}$$ Phase field fracture model is implemented. Staggered scheme is used for two-way coupling of displacement field and damage field. Miehe's model of spectral decomposition is implemented for a 3D case. |
+| [thermal_mechanical](https://github.com/deepmodeling/jax-fem/tree/main/demos/thermal_mechanical) | $${\color{orange}Multi-physics \space Coupling:}$$ Thermal-mechanical modeling of metal additive manufacturing process. One-way coupling is implemented (temperature affects displacement). |
+| [thermal_mechanical_full](https://github.com/deepmodeling/jax-fem/tree/main/demos/thermal_mechanical_full) | $${\color{orange}Multi-physics \space Coupling:}$$ Thermal-mechanical modeling of 2D plate. Two-way coupling (temperature and displacement) is implemented with a monolithic scheme. |
+| [wave](https://github.com/deepmodeling/jax-fem/tree/main/demos/wave) | $${\color{lightblue}Time \space Dependent \space Problem:}$$ The scalar wave equation is solved with backward difference scheme. |
+| [topology_optimization](https://github.com/deepmodeling/jax-fem/tree/main/demos/topology_optimization) | $${\color{red}Inverse \space Problem:}$$ SIMP topology optimization for a 2D beam. Note that sensitivity analysis is done by the program, rather than manual derivation. |
+| [inverse](https://github.com/deepmodeling/jax-fem/tree/main/demos/inverse) | $${\color{red}Inverse \space Problem:}$$ Sanity check of how automatic differentiation works. |
+| [plasticity_gradient](https://github.com/deepmodeling/jax-fem/tree/main/applications/plasticity_gradient) | $${\color{red}Inverse \space Problem:}$$ Automatic sensitivity analysis involving history variables such as plasticity. |
+
+## License
+
+This project is licensed under the GNU General Public License v3 - see the [LICENSE](https://www.gnu.org/licenses/) for details.
+
+## Citations
+
+If you found this library useful in academic or industry work, we appreciate your support if you consider 1) starring the project on Github, and 2) citing relevant papers:
+
+```bibtex
+@article{xue2023jax,
+  title={JAX-FEM: A differentiable GPU-accelerated 3D finite element solver for automatic inverse design and mechanistic data science},
+  author={Xue, Tianju and Liao, Shuheng and Gan, Zhengtao and Park, Chanwook and Xie, Xiaoyu and Liu, Wing Kam and Cao, Jian},
+  journal={Computer Physics Communications},
+  pages={108802},
+  year={2023},
+  publisher={Elsevier}
+}
+```
+</file>
+
+<file path="jax_fem/solver.py">
+import jax
+import jax.numpy as np
+import jax.flatten_util
+import numpy as onp
+from jax.experimental.sparse import BCOO
+import scipy
+import time
+from petsc4py import PETSc
+
+from jax_fem import logger
+
+from jax import config
+config.update("jax_enable_x64", True)
+
+
+################################################################################
+# JAX solver or scipy solver or PETSc solver
+
+def jax_solve(A, b, x0, precond):
+    """Solves the equilibrium equation using a JAX solver.
+
+    Parameters
+    ----------
+    precond
+        Whether to calculate the preconditioner or not
+    """
+    logger.debug(f"JAX Solver - Solving linear system")
+    indptr, indices, data = A.getValuesCSR()
+    A_sp_scipy = scipy.sparse.csr_array((data, indices, indptr), shape=A.getSize())
+    A = BCOO.from_scipy_sparse(A_sp_scipy).sort_indices()
+    jacobi = np.array(A_sp_scipy.diagonal())
+    pc = lambda x: x * (1. / jacobi) if precond else None
+    x, info = jax.scipy.sparse.linalg.bicgstab(A,
+                                               b,
+                                               x0=x0,
+                                               M=pc,
+                                               tol=1e-10,
+                                               atol=1e-10,
+                                               maxiter=10000)
+
+    # Verify convergence
+    err = np.linalg.norm(A @ x - b)
+    logger.debug(f"JAX Solver - Finshed solving, res = {err}")
+    assert err < 0.1, f"JAX linear solver failed to converge with err = {err}"
+    x = np.where(err < 0.1, x, np.nan) # For assert purpose, some how this also affects bicgstab.
+
+    return x
+
+def umfpack_solve(A, b):
+    logger.debug(f"Scipy Solver - Solving linear system with UMFPACK")
+    indptr, indices, data = A.getValuesCSR()
+    Asp = scipy.sparse.csr_matrix((data, indices, indptr))
+    x = scipy.sparse.linalg.spsolve(Asp, onp.array(b))
+
+    # TODO: try https://jax.readthedocs.io/en/latest/_autosummary/jax.experimental.sparse.linalg.spsolve.html
+    # x = jax.experimental.sparse.linalg.spsolve(av, aj, ai, b)
+
+    logger.debug(f'Scipy Solver - Finished solving, linear solve res = {np.linalg.norm(Asp @ x - b)}')
+    return x
+
+
+def petsc_solve(A, b, ksp_type, pc_type):
+    rhs = PETSc.Vec().createSeq(len(b))
+    rhs.setValues(range(len(b)), onp.array(b))
+    ksp = PETSc.KSP().create()
+    ksp.setOperators(A)
+    ksp.setFromOptions()
+    ksp.setType(ksp_type)
+    ksp.pc.setType(pc_type)
+
+    # TODO: This works better. Do we need to generalize the code a little bit?
+    if ksp_type == 'tfqmr':
+        ksp.pc.setFactorSolverType('mumps')
+
+    logger.debug(f'PETSc Solver - Solving linear system with ksp_type = {ksp.getType()}, pc = {ksp.pc.getType()}')
+    x = PETSc.Vec().createSeq(len(b))
+    ksp.solve(rhs, x)
+
+    # Verify convergence
+    y = PETSc.Vec().createSeq(len(b))
+    A.mult(x, y)
+
+    err = np.linalg.norm(y.getArray() - rhs.getArray())
+    logger.debug(f"PETSc Solver - Finished solving, linear solve res = {err}")
+    assert err < 0.1, f"PETSc linear solver failed to converge, err = {err}"
+
+    return x.getArray()
+
+
+def linear_solver(A, b, x0, solver_options):
+
+    # If user does not specify any solver, set jax_solver as the default one.
+    if  len(solver_options.keys() & {'jax_solver', 'umfpack_solver', 'petsc_solver', 'custom_solver'}) == 0: 
+        solver_options['jax_solver'] = {}
+
+    if 'jax_solver' in solver_options:      
+        precond = solver_options['jax_solver']['precond'] if 'precond' in solver_options['jax_solver'] else True
+        x = jax_solve(A, b, x0, precond)
+    elif 'umfpack_solver' in solver_options:
+        x = umfpack_solve(A, b)
+    elif 'petsc_solver' in solver_options:   
+        ksp_type = solver_options['petsc_solver']['ksp_type'] if 'ksp_type' in solver_options['petsc_solver'] else  'bcgsl' 
+        pc_type = solver_options['petsc_solver']['pc_type'] if 'pc_type' in solver_options['petsc_solver'] else 'ilu'
+        x = petsc_solve(A, b, ksp_type, pc_type)
+    elif 'custom_solver' in solver_options:
+        # Users can define their own solver
+        custom_solver = solver_options['custom_solver']
+        x = custom_solver(A, b, x0, solver_options)
+    else:
+        raise NotImplementedError(f"Unknown linear solver.")
+
+    return x
+
+
+################################################################################
+# "row elimination" solver
+
+def apply_bc_vec(res_vec, dofs, problem, scale=1.):
+    res_list = problem.unflatten_fn_sol_list(res_vec)
+    sol_list = problem.unflatten_fn_sol_list(dofs)
+
+    for ind, fe in enumerate(problem.fes):
+        res = res_list[ind]
+        sol = sol_list[ind]
+        for i in range(len(fe.node_inds_list)):
+            res = (res.at[fe.node_inds_list[i], fe.vec_inds_list[i]].set(
+                sol[fe.node_inds_list[i], fe.vec_inds_list[i]], unique_indices=True))
+            res = res.at[fe.node_inds_list[i], fe.vec_inds_list[i]].add(-fe.vals_list[i]*scale)
+
+        res_list[ind] = res
+
+    return jax.flatten_util.ravel_pytree(res_list)[0]
+
+
+def apply_bc(res_fn, problem, scale=1.):
+    def res_fn_bc(dofs):
+        """Apply Dirichlet boundary conditions
+        """
+        res_vec = res_fn(dofs)
+        return apply_bc_vec(res_vec, dofs, problem, scale)
+    return res_fn_bc
+
+
+def assign_bc(dofs, problem):
+    sol_list = problem.unflatten_fn_sol_list(dofs)
+    for ind, fe in enumerate(problem.fes):
+        sol = sol_list[ind]
+        for i in range(len(fe.node_inds_list)):
+            sol = sol.at[fe.node_inds_list[i],
+                         fe.vec_inds_list[i]].set(fe.vals_list[i])
+        sol_list[ind] = sol
+    return jax.flatten_util.ravel_pytree(sol_list)[0]
+
+
+def assign_ones_bc(dofs, problem):
+    sol_list = problem.unflatten_fn_sol_list(dofs)
+    for ind, fe in enumerate(problem.fes):
+        sol = sol_list[ind]
+        for i in range(len(fe.node_inds_list)):
+            sol = sol.at[fe.node_inds_list[i],
+                         fe.vec_inds_list[i]].set(1.)
+        sol_list[ind] = sol
+    return jax.flatten_util.ravel_pytree(sol_list)[0]
+
+
+def assign_zeros_bc(dofs, problem):
+    sol_list = problem.unflatten_fn_sol_list(dofs)
+    for ind, fe in enumerate(problem.fes):
+        sol = sol_list[ind]
+        for i in range(len(fe.node_inds_list)):
+            sol = sol.at[fe.node_inds_list[i],
+                         fe.vec_inds_list[i]].set(0.)
+        sol_list[ind] = sol
+    return jax.flatten_util.ravel_pytree(sol_list)[0]
+
+
+def copy_bc(dofs, problem):
+    new_dofs = np.zeros_like(dofs)
+    sol_list = problem.unflatten_fn_sol_list(dofs)
+    new_sol_list = problem.unflatten_fn_sol_list(new_dofs)
+  
+    for ind, fe in enumerate(problem.fes):
+        sol = sol_list[ind]
+        new_sol = new_sol_list[ind]
+        for i in range(len(fe.node_inds_list)):
+            new_sol = (new_sol.at[fe.node_inds_list[i],
+                                  fe.vec_inds_list[i]].set(sol[fe.node_inds_list[i],
+                                          fe.vec_inds_list[i]]))
+        new_sol_list[ind] = new_sol
+
+    return jax.flatten_util.ravel_pytree(new_sol_list)[0]
+
+
+def get_flatten_fn(fn_sol_list, problem):
+
+    def fn_dofs(dofs):
+        sol_list = problem.unflatten_fn_sol_list(dofs)
+        val_list = fn_sol_list(sol_list)
+        return jax.flatten_util.ravel_pytree(val_list)[0]
+
+    return fn_dofs
+
+
+def operator_to_matrix(operator_fn, problem):
+    """Only used for when debugging.
+    Can be used to print the matrix, check the conditional number, etc.
+    """
+    J = jax.jacfwd(operator_fn)(np.zeros(problem.num_total_dofs_all_vars))
+    return J
+
+
+def linear_incremental_solver(problem, res_vec, A, dofs, solver_options):
+    """
+    Linear solver at each Newton's iteration
+    """
+    logger.debug(f"Solving linear system...")
+    b = -res_vec
+
+    # x0 will always be correct at boundary locations
+    x0_1 = assign_bc(np.zeros(problem.num_total_dofs_all_vars), problem)
+    if hasattr(problem, 'P_mat'):
+        x0_2 = copy_bc(problem.P_mat @ dofs, problem)
+        x0 = problem.P_mat.T @ (x0_1 - x0_2)
+    else:
+        x0_2 = copy_bc(dofs, problem)
+        x0 = x0_1 - x0_2
+
+    inc = linear_solver(A, b, x0, solver_options)
+
+    line_search_flag = solver_options['line_search_flag'] if 'line_search_flag' in solver_options else False
+    if line_search_flag:
+        dofs = line_search(problem, dofs, inc)
+    else:
+        dofs = dofs + inc
+
+    return dofs
+
+
+def line_search(problem, dofs, inc):
+    """
+    TODO: This is useful for finite deformation plasticity.
+    """
+    res_fn = problem.compute_residual
+    res_fn = get_flatten_fn(res_fn, problem)
+    res_fn = apply_bc(res_fn, problem)
+
+    def res_norm_fn(alpha):
+        res_vec = res_fn(dofs + alpha*inc)
+        return np.linalg.norm(res_vec)
+
+    # grad_res_norm_fn = jax.grad(res_norm_fn)
+    # hess_res_norm_fn = jax.hessian(res_norm_fn)
+
+    # tol = 1e-3
+    # alpha = 1.
+    # lr = 1.
+    # grad_alpha = 1.
+    # while np.abs(grad_alpha) > tol:
+    #     grad_alpha = grad_res_norm_fn(alpha)
+    #     hess_alpha = hess_res_norm_fn(alpha)
+    #     alpha = alpha - 1./hess_alpha*grad_alpha
+    #     print(f"alpha = {alpha}, grad_alpha = {grad_alpha}, hess_alpha = {hess_alpha}")
+
+    alpha = 1.
+    res_norm = res_norm_fn(alpha)
+    for i in range(3):
+        alpha *= 0.5
+        res_norm_half = res_norm_fn(alpha)
+        print(f"i = {i}, res_norm = {res_norm}, res_norm_half = {res_norm_half}")
+        if res_norm_half > res_norm:
+            alpha *= 2.
+            break
+        res_norm = res_norm_half
+
+    return dofs + alpha*inc
+
+
+def get_A(problem):
+    logger.debug(f"Creating sparse matrix with scipy...")
+    A_sp_scipy = scipy.sparse.csr_array((onp.array(problem.V), (problem.I, problem.J)),
+        shape=(problem.num_total_dofs_all_vars, problem.num_total_dofs_all_vars))
+    # logger.info(f"Global sparse matrix takes about {A_sp_scipy.data.shape[0]*8*3/2**30} G memory to store.")
+
+    A = PETSc.Mat().createAIJ(size=A_sp_scipy.shape, 
+                              csr=(A_sp_scipy.indptr.astype(PETSc.IntType, copy=False),
+                                   A_sp_scipy.indices.astype(PETSc.IntType, copy=False), 
+                                   A_sp_scipy.data))
+
+    for ind, fe in enumerate(problem.fes):
+        for i in range(len(fe.node_inds_list)):
+            row_inds = onp.array(fe.node_inds_list[i] * fe.vec + fe.vec_inds_list[i] + problem.offset[ind], dtype=onp.int32)
+            A.zeroRows(row_inds)
+
+    # Linear multipoint constraints
+    if hasattr(problem, 'P_mat'):
+        P = PETSc.Mat().createAIJ(size=problem.P_mat.shape, csr=(problem.P_mat.indptr.astype(PETSc.IntType, copy=False),
+                                                   problem.P_mat.indices.astype(PETSc.IntType, copy=False), problem.P_mat.data))
+
+        tmp = A.matMult(P)
+        P_T = P.transpose()
+        A = P_T.matMult(tmp)
+
+    return A
+
+
+################################################################################
+# The "row elimination" solver
+
+def solver(problem, solver_options={}):
+    """
+    Specify exactly either 'jax_solver' or 'umfpack_solver' or 'petsc_solver'
+    
+    Examples:
+    (1) solver_options = {'jax_solver': {}}
+    (2) solver_options = {'umfpack_solver': {}}
+    (3) solver_options = {'petsc_solver': {'ksp_type': 'bcgsl', 'pc_type': 'jacobi'}, 'initial_guess': some_guess}
+
+    Default parameters will be used if no instruction is found:
+
+    solver_options = 
+    {
+        # If multiple solvers are specified or no solver is specified, 'jax_solver' will be used.
+        'jax_solver': 
+        {
+            # The JAX built-in linear solver 
+            # Reference: https://jax.readthedocs.io/en/latest/_autosummary/jax.scipy.sparse.linalg.bicgstab.html
+            'precond': True,
+        }
+
+        'umfpack_solver': 
+        {   
+            # The scipy solver that calls UMFPACK
+            # Reference: https://docs.scipy.org/doc/scipy/reference/generated/scipy.sparse.linalg.spsolve.html
+        }
+
+        'petsc_solver':
+        {   
+            # PETSc solver
+            # For more ksp_type and pc_type: https://www.mcs.anl.gov/petsc/petsc4py-current/docs/apiref/index.html
+            'ksp_type': 'bcgsl', # e.g., 'minres', 'gmres', 'tfqmr'
+            'pc_type': 'ilu', # e.g., 'jacobi'
+        }
+
+        'line_search_flag': False, # Line search method
+        'initial_guess': initial_guess, # Same shape as sol_list
+        'tol': 1e-5, # Absolute tolerance for residual vector (l2 norm), used in Newton's method
+        'rel_tol': 1e-8, # Relative tolerance for residual vector (l2 norm), used in Newton's method
+    }
+
+    The solver imposes Dirichlet B.C. with "row elimination" method.
+
+    Some memo:
+
+    res(u) = D*r(u) + (I - D)u - u_b
+    D = [[1 0 0 0]
+         [0 1 0 0]
+         [0 0 0 0]
+         [0 0 0 1]]
+    I = [[1 0 0 0]
+         [0 1 0 0]
+         [0 0 1 0]
+         [0 0 0 1]
+    A = d(res)/d(u) = D*dr/du + (I - D)
+
+    TODO: linear multipoint constraint
+
+    The function newton_update computes r(u) and dr/du
+    """
+    logger.debug(f"Calling the row elimination solver for imposing Dirichlet B.C.")
+    logger.debug("Start timing")
+    start = time.time()
+
+    if 'initial_guess' in solver_options:
+        # We dont't want inititual guess to play a role in the differentiation chain.
+        initial_guess = jax.lax.stop_gradient(solver_options['initial_guess'])
+        dofs = jax.flatten_util.ravel_pytree(initial_guess)[0]
+    else:
+        if hasattr(problem, 'P_mat'):
+            dofs = np.zeros(problem.P_mat.shape[1]) # reduced dofs
+        else:
+            dofs = np.zeros(problem.num_total_dofs_all_vars)
+
+    rel_tol = solver_options['rel_tol'] if 'rel_tol' in solver_options else 1e-8
+    tol = solver_options['tol'] if 'tol' in solver_options else 1e-6
+
+    def newton_update_helper(dofs):
+        if hasattr(problem, 'P_mat'):
+            dofs = problem.P_mat @ dofs
+
+        sol_list = problem.unflatten_fn_sol_list(dofs)
+        res_list = problem.newton_update(sol_list)
+        res_vec = jax.flatten_util.ravel_pytree(res_list)[0]
+        res_vec = apply_bc_vec(res_vec, dofs, problem)
+
+        if hasattr(problem, 'P_mat'):
+            res_vec = problem.P_mat.T @ res_vec
+
+        A = get_A(problem)
+        return res_vec, A
+
+    res_vec, A = newton_update_helper(dofs)
+    res_val = np.linalg.norm(res_vec)
+    res_val_initial = res_val
+    rel_res_val = res_val/res_val_initial
+    logger.debug(f"Before, l_2 res = {res_val}, relative l_2 res = {rel_res_val}")
+    while (rel_res_val > rel_tol) and (res_val > tol):
+        dofs = linear_incremental_solver(problem, res_vec, A, dofs, solver_options)
+        res_vec, A = newton_update_helper(dofs)
+        # logger.debug(f"DEBUG: l_2 res = {np.linalg.norm(apply_bc_vec(A @ dofs, dofs, problem))}")
+        res_val = np.linalg.norm(res_vec)
+        rel_res_val = res_val/res_val_initial
+
+        logger.debug(f"l_2 res = {res_val}, relative l_2 res = {rel_res_val}")
+
+    assert np.all(np.isfinite(res_val)), f"res_val contains NaN, stop the program!"
+    assert np.all(np.isfinite(dofs)), f"dofs contains NaN, stop the program!"
+
+    if hasattr(problem, 'P_mat'):
+        dofs = problem.P_mat @ dofs
+
+    # If sol_list = [[[u1x, u1y], 
+    #                 [u2x, u2y], 
+    #                 [u3x, u3y], 
+    #                 [u4x, u4y]], 
+    #                [[p1], 
+    #                 [p2]]],
+    # the flattend DOF vector will be [u1x, u1y, u2x, u2y, u3x, u3y, u4x, u4y, p1, p2]
+    sol_list = problem.unflatten_fn_sol_list(dofs)
+
+    end = time.time()
+    solve_time = end - start
+    logger.info(f"Solve took {solve_time} [s]")
+    logger.debug(f"max of dofs = {np.max(dofs)}")
+    logger.debug(f"min of dofs = {np.min(dofs)}")
+
+    return sol_list
+
+
+################################################################################
+# The "arc length" solver
+# Reference: Vasios, Nikolaos. "Nonlinear analysis of structures." The Arc-Length method. Harvard (2015).
+# Our implementation follows the Crisfeld's formulation
+
+# TODO: Do we want to merge displacement-control and force-control codes?
+
+def arc_length_solver_disp_driven(problem, prev_u_vec, prev_lamda, prev_Delta_u_vec, prev_Delta_lamda, Delta_l=0.1, psi=1.):
+    """
+    TODO: Does not support periodic B.C., need some work here.
+    """
+    def newton_update_helper(dofs):
+        sol_list = problem.unflatten_fn_sol_list(dofs)
+        res_list = problem.newton_update(sol_list)
+        res_vec = jax.flatten_util.ravel_pytree(res_list)[0]
+        res_vec = apply_bc_vec(res_vec, dofs, problem, lamda)
+        A = get_A(problem)
+        return res_vec, A
+
+    def u_lamda_dot_product(Delta_u_vec1, Delta_lamda1, Delta_u_vec2, Delta_lamda2):
+        return np.sum(Delta_u_vec1*Delta_u_vec2) + psi**2.*Delta_lamda1*Delta_lamda2*np.sum(u_b**2.)
+ 
+    u_vec = prev_u_vec
+    lamda = prev_lamda
+
+    u_b = assign_bc(np.zeros_like(prev_u_vec), problem)
+
+    Delta_u_vec_dir = prev_Delta_u_vec
+    Delta_lamda_dir = prev_Delta_lamda
+
+    tol = 1e-6
+    res_val = 1.
+    while res_val > tol:
+
+        res_vec, A = newton_update_helper(u_vec)
+        res_val = np.linalg.norm(res_vec)
+        logger.debug(f"Arc length solver: res_val = {res_val}")
+  
+        delta_u_bar = umfpack_solve(A, -res_vec)
+        delta_u_t = umfpack_solve(A, u_b)
+
+        Delta_u_vec = u_vec - prev_u_vec
+        Delta_lamda = lamda - prev_lamda
+        a1 = np.sum(delta_u_t**2.) + psi**2.*np.sum(u_b**2.)
+        a2 = 2.* np.sum((Delta_u_vec + delta_u_bar)*delta_u_t) + 2.*psi**2.*Delta_lamda*np.sum(u_b**2.)
+        a3 = np.sum((Delta_u_vec + delta_u_bar)**2.) + psi**2.*Delta_lamda**2.*np.sum(u_b**2.) - Delta_l**2.
+
+        delta_lamda1 = (-a2 + np.sqrt(a2**2. - 4.*a1*a3))/(2.*a1)
+        delta_lamda2 = (-a2 - np.sqrt(a2**2. - 4.*a1*a3))/(2.*a1)
+
+        logger.debug(f"Arc length solver: delta_lamda1 = {delta_lamda1}, delta_lamda2 = {delta_lamda2}")
+        assert np.isfinite(delta_lamda1) and np.isfinite(delta_lamda2), f"No valid solutions for delta lambda, a1 = {a1}, a2 = {a2}, a3 = {a3}"
+
+        delta_u_vec1 = delta_u_bar + delta_lamda1 * delta_u_t
+        delta_u_vec2 = delta_u_bar + delta_lamda2 * delta_u_t
+
+        Delta_u_vec_dir1 = u_vec + delta_u_vec1 - prev_u_vec
+        Delta_lamda_dir1 = lamda + delta_lamda1 - prev_lamda
+        dot_prod1 = u_lamda_dot_product(Delta_u_vec_dir, Delta_lamda_dir, Delta_u_vec_dir1, Delta_lamda_dir1)
+
+        Delta_u_vec_dir2 = u_vec + delta_u_vec2 - prev_u_vec
+        Delta_lamda_dir2 = lamda + delta_lamda2 - prev_lamda
+        dot_prod2 = u_lamda_dot_product(Delta_u_vec_dir, Delta_lamda_dir, Delta_u_vec_dir2, Delta_lamda_dir2)
+
+        if np.abs(dot_prod1) < 1e-10 and np.abs(dot_prod2) < 1e-10:
+            # At initial step, (Delta_u_vec_dir, Delta_lamda_dir) is zero, so both dot_prod1 and dot_prod2 are zero.
+            # We simply select the larger value for delta_lamda.
+            delta_lamda = np.maximum(delta_lamda1, delta_lamda2)
+        elif dot_prod1 > dot_prod2:
+            delta_lamda = delta_lamda1
+        else:
+            delta_lamda = delta_lamda2
+
+        lamda = lamda + delta_lamda
+        delta_u = delta_u_bar + delta_lamda * delta_u_t
+        u_vec = u_vec + delta_u
+
+        Delta_u_vec_dir = u_vec - prev_u_vec
+        Delta_lamda_dir = lamda - prev_lamda
+
+    logger.debug(f"Arc length solver: finished for one step, with Delta lambda = {lamda - prev_lamda}")
+ 
+    return u_vec, lamda, Delta_u_vec_dir, Delta_lamda_dir
+
+
+def arc_length_solver_force_driven(problem, prev_u_vec, prev_lamda, prev_Delta_u_vec, prev_Delta_lamda, q_vec, Delta_l=0.1, psi=1.):
+    """
+    TODO: Does not support periodic B.C., need some work here.
+    """
+    def newton_update_helper(dofs):
+        sol_list = problem.unflatten_fn_sol_list(dofs)
+        res_list = problem.newton_update(sol_list)
+        res_vec = jax.flatten_util.ravel_pytree(res_list)[0]
+        res_vec = apply_bc_vec(res_vec, dofs, problem)
+        A = get_A(problem)
+        return res_vec, A
+
+    def u_lamda_dot_product(Delta_u_vec1, Delta_lamda1, Delta_u_vec2, Delta_lamda2):
+        return np.sum(Delta_u_vec1*Delta_u_vec2) + psi**2.*Delta_lamda1*Delta_lamda2*np.sum(q_vec_mapped**2.)
+ 
+    u_vec = prev_u_vec
+    lamda = prev_lamda
+    q_vec_mapped = assign_zeros_bc(q_vec, problem)
+
+    Delta_u_vec_dir = prev_Delta_u_vec
+    Delta_lamda_dir = prev_Delta_lamda
+
+    tol = 1e-6
+    res_val = 1.
+    while res_val > tol:
+        res_vec, A = newton_update_helper(u_vec)
+        res_val = np.linalg.norm(res_vec + lamda*q_vec_mapped)
+        logger.debug(f"Arc length solver: res_val = {res_val}")
+
+        # TODO: the scipy umfpack solver seems to be far better than the jax linear solver, so we use umfpack solver here.
+        # x0_1 = assign_bc(np.zeros_like(u_vec), problem)
+        # x0_2 = copy_bc(u_vec, problem)
+        # delta_u_bar = jax_solve(problem, A, -(res_vec + lamda*q_vec_mapped), x0=x0_1 - x0_2, precond=True)   
+        # delta_u_t = jax_solve(problem, A, -q_vec_mapped, x0=np.zeros_like(u_vec), precond=True)   
+
+        delta_u_bar = umfpack_solve(A, -(res_vec + lamda*q_vec_mapped))
+        delta_u_t = umfpack_solve(A, -q_vec_mapped)
+
+        Delta_u_vec = u_vec - prev_u_vec
+        Delta_lamda = lamda - prev_lamda
+        a1 = np.sum(delta_u_t**2.) + psi**2.*np.sum(q_vec_mapped**2.)
+        a2 = 2.* np.sum((Delta_u_vec + delta_u_bar)*delta_u_t) + 2.*psi**2.*Delta_lamda*np.sum(q_vec_mapped**2.)
+        a3 = np.sum((Delta_u_vec + delta_u_bar)**2.) + psi**2.*Delta_lamda**2.*np.sum(q_vec_mapped**2.) - Delta_l**2.
+
+        delta_lamda1 = (-a2 + np.sqrt(a2**2. - 4.*a1*a3))/(2.*a1)
+        delta_lamda2 = (-a2 - np.sqrt(a2**2. - 4.*a1*a3))/(2.*a1)
+
+        logger.debug(f"Arc length solver: delta_lamda1 = {delta_lamda1}, delta_lamda2 = {delta_lamda2}")
+        assert np.isfinite(delta_lamda1) and np.isfinite(delta_lamda2), f"No valid solutions for delta lambda, a1 = {a1}, a2 = {a2}, a3 = {a3}"
+
+        delta_u_vec1 = delta_u_bar + delta_lamda1 * delta_u_t
+        delta_u_vec2 = delta_u_bar + delta_lamda2 * delta_u_t
+
+        Delta_u_vec_dir1 = u_vec + delta_u_vec1 - prev_u_vec
+        Delta_lamda_dir1 = lamda + delta_lamda1 - prev_lamda
+        dot_prod1 = u_lamda_dot_product(Delta_u_vec_dir, Delta_lamda_dir, Delta_u_vec_dir1, Delta_lamda_dir1)
+
+        Delta_u_vec_dir2 = u_vec + delta_u_vec2 - prev_u_vec
+        Delta_lamda_dir2 = lamda + delta_lamda2 - prev_lamda
+        dot_prod2 = u_lamda_dot_product(Delta_u_vec_dir, Delta_lamda_dir, Delta_u_vec_dir2, Delta_lamda_dir2)
+
+        if np.abs(dot_prod1) < 1e-10 and np.abs(dot_prod2) < 1e-10:
+            # At initial step, (Delta_u_vec_dir, Delta_lamda_dir) is zero, so both dot_prod1 and dot_prod2 are zero.
+            # We simply select the larger value for delta_lamda.
+            delta_lamda = np.maximum(delta_lamda1, delta_lamda2)
+        elif dot_prod1 > dot_prod2:
+            delta_lamda = delta_lamda1
+        else:
+            delta_lamda = delta_lamda2
+
+        lamda = lamda + delta_lamda
+        delta_u = delta_u_bar + delta_lamda * delta_u_t
+        u_vec = u_vec + delta_u
+
+        Delta_u_vec_dir = u_vec - prev_u_vec
+        Delta_lamda_dir = lamda - prev_lamda
+
+    logger.debug(f"Arc length solver: finished for one step, with Delta lambda = {lamda - prev_lamda}")
+ 
+    return u_vec, lamda, Delta_u_vec_dir, Delta_lamda_dir
+
+
+def get_q_vec(problem):
+    """
+    Used in the arc length method only, to get the external force vector q_vec
+    """
+    dofs = np.zeros(problem.num_total_dofs_all_vars)
+    sol_list = problem.unflatten_fn_sol_list(dofs)
+    res_list = problem.newton_update(sol_list)
+    q_vec = jax.flatten_util.ravel_pytree(res_list)[0]
+    return q_vec
+
+
+################################################################################
+# Dynamic relaxation solver
+
+def assembleCSR(problem, dofs):
+    sol_list = problem.unflatten_fn_sol_list(dofs)
+    problem.newton_update(sol_list)
+    A_sp_scipy = scipy.sparse.csr_array((problem.V, (problem.I, problem.J)),
+        shape=(problem.fes[0].num_total_dofs, problem.fes[0].num_total_dofs))
+
+    for ind, fe in enumerate(problem.fes):
+        for i in range(len(fe.node_inds_list)):
+            row_inds = onp.array(fe.node_inds_list[i] * fe.vec + fe.vec_inds_list[i] + problem.offset[ind], dtype=onp.int32)
+            for row_ind in row_inds:
+                A_sp_scipy.data[A_sp_scipy.indptr[row_ind]: A_sp_scipy.indptr[row_ind + 1]] = 0.
+                A_sp_scipy[row_ind, row_ind] = 1.
+
+    return A_sp_scipy
+
+
+def calC(t, cmin, cmax):
+
+    if t < 0.: t = 0.
+
+    c = 2. * onp.sqrt(t)
+    if (c < cmin): c = cmin
+    if (c > cmax): c = cmax
+
+    return c
+
+
+def printInfo(error, t, c, tol, eps, qdot, qdotdot, nIters, nPrint, info, info_force):
+
+    ## printing control
+    if nIters % nPrint == 1:
+        #logger.info('\t------------------------------------')
+        if info_force == True:
+            print(('\nDR Iteration %d: Max force (residual error) = %g (tol = %g)' +
+                   'Max velocity = %g') % (nIters, error, tol,
+                                            np.max(np.absolute(qdot))))
+        if info == True:
+            print('\nDamping t: ',t, );
+            print('Damping coefficient: ', c)
+            print('Max epsilon: ',np.max(eps))
+            print('Max acceleration: ',np.max(np.absolute(qdotdot)))
+
+
+def dynamic_relax_solve(problem, tol=1e-6, nKMat=50, nPrint=500, info=True, info_force=True, initial_guess=None):
+    """
+    Implementation of
+
+    Luet, David Joseph. Bounding volume hierarchy and non-uniform rational B-splines for contact enforcement
+    in large deformation finite element analysis of sheet metal forming. Diss. Princeton University, 2016.
+    Chapter 4.3 Nonlinear System Solution
+
+    Particularly good for handling buckling behavior.
+    There is a FEniCS version of this dynamic relaxation algorithm.
+    The code below is a direct translation from the FEniCS version.
+
+ 
+    TODO: Does not support periodic B.C., need some work here.
+    """
+    solver_options = {'umfpack_solver': {}}
+
+    # TODO: consider these in initial guess
+    def newton_update_helper(dofs):
+        sol_list = problem.unflatten_fn_sol_list(dofs)
+        res_list = problem.newton_update(sol_list)
+        res_vec = jax.flatten_util.ravel_pytree(res_list)[0]
+        res_vec = apply_bc_vec(res_vec, dofs, problem)
+        A = get_A(problem)
+        return res_vec, A
+ 
+    dofs = np.zeros(problem.num_total_dofs_all_vars)
+    res_vec, A = newton_update_helper(dofs)
+    dofs = linear_incremental_solver(problem, res_vec, A, dofs, solver_options)
+
+    if initial_guess is not None:
+        dofs = initial_guess
+        dofs = assign_bc(dofs, problem)
+
+    # parameters not to change
+    cmin = 1e-3
+    cmax = 3.9
+    h_tilde = 1.1
+    h = 1.
+
+    # initialize all arrays
+    N = len(dofs)  #print("--------num of DOF's: %d-----------" % N)
+    #initialize displacements, velocities and accelerations
+    q, qdot, qdotdot = onp.zeros(N), onp.zeros(N), onp.zeros(N)
+    #initialize displacements, velocities and accelerations from a previous time step
+    q_old, qdot_old, qdotdot_old = onp.zeros(N), onp.zeros(N), onp.zeros(N)
+    #initialize the M, eps, R_old arrays
+    eps, M, R, R_old = onp.zeros(N), onp.zeros(N), onp.zeros(N), onp.zeros(N)
+
+    @jax.jit
+    def assembleVec(dofs):
+        res_fn = get_flatten_fn(problem.compute_residual, problem)
+        res_vec = res_fn(dofs)
+        res_vec = assign_zeros_bc(res_vec, problem)
+        return res_vec
+
+    R = onp.array(assembleVec(dofs))
+    KCSR = assembleCSR(problem, dofs)
+
+    M[:] = h_tilde * h_tilde / 4. * onp.array(
+        onp.absolute(KCSR).sum(axis=1)).squeeze()
+    q[:] = dofs
+    qdot[:] = -h / 2. * R / M
+    # set the counters for iterations and
+    nIters, iKMat = 0, 0
+    error = 1.0
+    timeZ = time.time() #Measurement of loop time.
+
+    assert onp.all(onp.isfinite(M)), f"M not finite"
+    assert onp.all(onp.isfinite(q)), f"q not finite"
+    assert onp.all(onp.isfinite(qdot)), f"qdot not finite"
+
+    error = onp.max(onp.absolute(R))
+
+    while error > tol:
+
+        print(f"error = {error}")
+        # marching forward
+        q_old[:] = q[:]; R_old[:] = R[:]
+        q[:] += h*qdot; dofs = np.array(q)
+
+        R = onp.array(assembleVec(dofs))
+
+        nIters += 1
+        iKMat += 1
+        error = onp.max(onp.absolute(R))
+
+        # damping calculation
+        S0 = onp.dot((R - R_old) / h, qdot)
+        t = S0 / onp.einsum('i,i,i', qdot, M, qdot)
+        c = calC(t, cmin, cmax)
+
+        # determine whether to recal KMat
+        eps = h_tilde * h_tilde / 4. * onp.absolute(
+            onp.divide((qdotdot - qdotdot_old), (q - q_old),
+                       out=onp.zeros_like((qdotdot - qdotdot_old)),
+                       where=(q - q_old) != 0))
+
+        # calculating the jacobian matrix
+        if ((onp.max(eps) > 1) and (iKMat > nKMat)): #SPR JAN max --> min
+            if info == True:
+                print('\nRecalculating the tangent matrix: ', nIters)
+
+            iKMat = 0
+            KCSR = assembleCSR(problem, dofs)
+            M[:] = h_tilde * h_tilde / 4. * onp.array(
+                onp.absolute(KCSR).sum(axis=1)).squeeze()
+
+        # compute new velocities and accelerations
+        qdot_old[:] = qdot[:]; qdotdot_old[:] = qdotdot[:];
+        qdot = (2.- c*h)/(2 + c*h) * qdot_old - 2.*h/(2.+c*h)* R / M
+        qdot_old[:] = qdot[:]
+        qdotdot = qdot - qdot_old
+
+        # output on screen
+        printInfo(error, t, c, tol, eps, qdot, qdotdot, nIters, nPrint, info, info_force)
+
+    # check if converged
+    convergence = True
+    if onp.isnan(onp.max(onp.absolute(R))):
+        convergence = False
+
+    # print final info
+    if convergence:
+        print("DRSolve finished in %d iterations and %fs" % \
+              (nIters, time.time() - timeZ))
+    else:
+        print("FAILED to converged")
+
+    sol_list = problem.unflatten_fn_sol_list(dofs)
+
+    return sol_list[0]
+
+
+################################################################################
+# Implicit differentiation with the adjoint method
+
+def implicit_vjp(problem, sol_list, params, v_list, adjoint_solver_options):
+
+    def constraint_fn(dofs, params):
+        """c(u, p)
+        """
+        problem.set_params(params)
+        res_fn = problem.compute_residual
+        res_fn = get_flatten_fn(res_fn, problem)
+        res_fn = apply_bc(res_fn, problem)
+        return res_fn(dofs)
+
+    def constraint_fn_sol_to_sol(sol_list, params):
+        dofs = jax.flatten_util.ravel_pytree(sol_list)[0]
+        con_vec = constraint_fn(dofs, params)
+        return problem.unflatten_fn_sol_list(con_vec)
+
+    def get_partial_params_c_fn(sol_list):
+        """c(u=u, p)
+        """
+        def partial_params_c_fn(params):
+            return constraint_fn_sol_to_sol(sol_list, params)
+
+        return partial_params_c_fn
+
+    def get_vjp_contraint_fn_params(params, sol_list):
+        """v*(partial dc/dp)
+        """
+        partial_c_fn = get_partial_params_c_fn(sol_list)
+        def vjp_linear_fn(v_list):
+            primals_output, f_vjp = jax.vjp(partial_c_fn, params)
+            val, = f_vjp(v_list)
+            return val
+        return vjp_linear_fn
+
+    problem.set_params(params)
+    problem.newton_update(sol_list)
+
+    A = get_A(problem)
+    v_vec = jax.flatten_util.ravel_pytree(v_list)[0]
+
+    if hasattr(problem, 'P_mat'):
+        v_vec = problem.P_mat.T @ v_vec
+
+    # Be careful that A.transpose() does in-place change to A
+    adjoint_vec = linear_solver(A.transpose(), v_vec, None, adjoint_solver_options)
+
+    if hasattr(problem, 'P_mat'):
+        adjoint_vec = problem.P_mat @ adjoint_vec
+
+    vjp_linear_fn = get_vjp_contraint_fn_params(params, sol_list)
+    vjp_result = vjp_linear_fn(problem.unflatten_fn_sol_list(adjoint_vec))
+    vjp_result = jax.tree_map(lambda x: -x, vjp_result)
+
+    return vjp_result
+
+
+def ad_wrapper(problem, solver_options={}, adjoint_solver_options={}):
+    @jax.custom_vjp
+    def fwd_pred(params):
+        problem.set_params(params)
+        sol_list = solver(problem, solver_options)
+        return sol_list
+
+    def f_fwd(params):
+        sol_list = fwd_pred(params)
+        return sol_list, (params, sol_list)
+
+    def f_bwd(res, v):
+        logger.info("Running backward and solving the adjoint problem...")
+        params, sol_list = res
+        vjp_result = implicit_vjp(problem, sol_list, params, v, adjoint_solver_options)
+        return (vjp_result, )
+
+    fwd_pred.defvjp(f_fwd, f_bwd)
+    return fwd_pred
+</file>
+
+</files>
