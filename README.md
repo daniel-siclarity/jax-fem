@@ -1,6 +1,6 @@
 # JAX-FEM Parasitic Capacitance
 
-This repository is a fork of [JAX-FEM](https://github.com/deepmodeling/jax-fem) with a focus on parasitic capacitance estimation for integrated circuits and VLSI designs.
+This repository is a fork of [JAX-FEM](https://github.com/deepmodeling/jax-fem) with a focus on parasitic capacitance estimation for integrated circuits and VLSI designs. This is a public branch for demo purpose. More advanced versions of integrations are in development in conjunction of our future product development.
 
 ## Parasitic Capacitance Estimation
 
